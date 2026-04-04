@@ -5,7 +5,7 @@ struct AlignedArray([i16; 8]);
 
 /// Vectorized int16 matrix multiplication using the ESP32-S3 qacc engine.
 /// Requirements:
-/// - k must be a multiple of 8.
+/// - m must be a multiple of 8.
 /// - A, B, C pointers must be 16-byte aligned.
 #[inline(never)]
 pub unsafe fn dspm_mult_s16_aes3_core(
@@ -28,52 +28,51 @@ pub unsafe fn dspm_mult_s16_aes3_core(
     }
 
     let mut ptr_c_runner = ptr_c as usize;
-    let b_stride_bytes = k * 2; // 2 bytes per i16
-    let mut ptr_a_row = ptr_a as usize;
+    let mut ptr_b_col = ptr_b as usize;
 
-    // Unrolled loop counters
+    let a_stride_bytes = m * 2;
+    let b_col_bytes = n * 2;
+
     let n_half = n / 2;
     let n_odd = n % 2;
-
-    // FIX: Pass the absolute shift directly to the hardware instruction
     let qacc_shift = shift;
 
-    // Outer Loop (M): Iterate over the rows of A
-    for _ in 0..m {
-        let mut ptr_b_col_block = ptr_b as usize;
+    // Iterate over the columns of B and C
+    for _ in 0..k {
+        let mut ptr_a_row_block = ptr_a as usize;
 
-        // Middle Loop (K): Iterate over the columns of B in chunks of 8
-        for _ in 0..(k / 8) {
-            let ptr_a_runner = ptr_a_row;
-            let ptr_b_runner = ptr_b_col_block;
+        // Iterate down the columns of A and C in chunks of 8
+        for _ in 0..(m / 8) {
+            let ptr_a_runner = ptr_a_row_block;
+            let ptr_b_runner = ptr_b_col;
             let ptr_round = round_data.0.as_ptr() as usize;
 
-            // Inner Loop (N): The Hardware Dot-Product Pipeline
+            // Hardware Dot-Product Pipeline
             unsafe {
                 asm!(
-                    // Load 128-bits of rounding offset data into the 'qacc' accumulator
+                    // Load rounding offset data into the 'qacc' accumulator
                     "ee.ldqa.u16.128.ip {ptr_round}, 0",
 
-                    // Pre-load: Broadcast 1 int16 from A into q1, load 8 int16s from B into q0
-                    "ee.vldbc.16.ip q1, {ptr_a_runner}, 2",
-                    "ee.vld.128.xp q0, {ptr_b_runner}, {b_stride_bytes}",
+                    // Pre-load: Broadcast 1 int16 from B into q1, load 8 int16s from A into q0
+                    "ee.vldbc.16.ip q1, {ptr_b_runner}, 2",
+                    "ee.vld.128.xp q0, {ptr_a_runner}, {a_stride_bytes}",
 
                     // If N is odd, process one initial iteration to align the unrolled loop
                     "beqz {n_odd}, 1f",
-                    "ee.vmulas.s16.qacc.ldbc.incp q1, {ptr_a_runner}, q0, q1",
-                    "ee.vld.128.xp q0, {ptr_b_runner}, {b_stride_bytes}",
+                    "ee.vmulas.s16.qacc.ldbc.incp q1, {ptr_b_runner}, q0, q1",
+                    "ee.vld.128.xp q0, {ptr_a_runner}, {a_stride_bytes}",
                     "1:",
 
                     // Hardware inner loop over remaining N blocks (Unrolled by 2)
                     "loopnez {n_half}, 2f",
-                        "ee.vld.128.xp q2, {ptr_b_runner}, {b_stride_bytes}",
-                        "ee.vmulas.s16.qacc.ldbc.incp q1, {ptr_a_runner}, q0, q1",
+                        "ee.vld.128.xp q2, {ptr_a_runner}, {a_stride_bytes}",
+                        "ee.vmulas.s16.qacc.ldbc.incp q1, {ptr_b_runner}, q0, q1",
 
-                        "ee.vld.128.xp q0, {ptr_b_runner}, {b_stride_bytes}",
-                        "ee.vmulas.s16.qacc.ldbc.incp q1, {ptr_a_runner}, q2, q1",
+                        "ee.vld.128.xp q0, {ptr_a_runner}, {a_stride_bytes}",
+                        "ee.vmulas.s16.qacc.ldbc.incp q1, {ptr_b_runner}, q2, q1",
                     "2:",
 
-                    // End of row: Shift, round, and compress qacc down to q0, then store to C
+                    // End of chunk: Shift, round, and compress qacc down to q0, store to C
                     "ee.srcmb.s16.qacc q0, {qacc_shift}, 1",
                     "ee.vst.128.ip q0, {ptr_c_runner}, 16",
 
@@ -85,27 +84,26 @@ pub unsafe fn dspm_mult_s16_aes3_core(
 
                     n_odd = in(reg) n_odd,
                     n_half = in(reg) n_half,
-                    b_stride_bytes = in(reg) b_stride_bytes,
+                    a_stride_bytes = in(reg) a_stride_bytes,
                     qacc_shift = in(reg) qacc_shift,
 
                     options(nostack)
                 );
             }
 
-            // Advance B block pointer by 8 i16 columns (16 bytes)
-            ptr_b_col_block += 16;
+            // Advance A row block pointer by 8 i16 elements down the column (16 bytes)
+            ptr_a_row_block += 16;
         }
-        // Advance A row pointer to the next row (N * 2 bytes)
-        ptr_a_row += n * 2;
+        // Advance B pointer to the next column
+        ptr_b_col += b_col_bytes;
     }
 }
 
 /// Safely multiply two Q15 fixed-point matrices.
 pub fn esp_gemm_s16(a: &[i16], b: &[i16], c: &mut [i16], m: usize, n: usize, k: usize, shift: i32) {
-    // The vector pipeline operates on 8 elements simultaneously
     assert!(
-        k % 8 == 0,
-        "k must be a multiple of 8 for SIMD S16 multiplication."
+        m % 8 == 0,
+        "m must be a multiple of 8 for SIMD S16 column-major multiplication."
     );
 
     let ptr_a = a.as_ptr();
@@ -117,14 +115,21 @@ pub fn esp_gemm_s16(a: &[i16], b: &[i16], c: &mut [i16], m: usize, n: usize, k: 
             dspm_mult_s16_aes3_core(ptr_a, ptr_b, ptr_c, m, n, k, shift);
         }
     } else {
-        // Software fallback for non-aligned data
-        for i in 0..m {
-            for j in 0..k {
-                let mut acc: i32 = 0;
+        let round_val = if shift < 0 {
+            16383 >> -shift
+        } else {
+            32767 >> shift
+        };
+
+        for j in 0..k {
+            for i in 0..m {
+                let mut acc: i32 = round_val;
                 for s in 0..n {
-                    acc += (a[i * n + s] as i32) * (b[s * k + j] as i32);
+                    let a_val = a[s * m + i] as i32;
+                    let b_val = b[j * n + s] as i32;
+                    acc += a_val * b_val;
                 }
-                c[i * k + j] = (acc >> shift) as i16;
+                c[j * m + i] = (acc >> shift) as i16;
             }
         }
     }

@@ -86,14 +86,16 @@ fn test_matrix_math_ex() {
     let a_slice = mat_a.as_slice();
     let b_slice = mat_b.as_slice();
 
-    // Manual row-major math matching the ANSI C definition of mult_ex
+    // Manual column-major math matching the new SIMD behavior
     for i in 0..m {
         for j in 0..k {
             let mut sum = 0.0;
             for s in 0..n {
-                sum += a_slice[i * a_stride + s] * b_slice[s * b_stride + j];
+                // Column-major indexing: slice[col * stride + row]
+                sum += a_slice[s * a_stride + i] * b_slice[j * b_stride + s];
             }
-            c_slice[i * k + j] = sum;
+            // c_slice natively has a stride of `m` (output rows)
+            c_slice[j * m + i] = sum;
         }
     }
 
@@ -145,10 +147,13 @@ fn test_matrix_math_fixed() {
         for j in 0..k {
             let mut sum: i32 = 0;
             for s in 0..n {
-                sum += (a_slice[i * n + s] as i32) * (b_slice[s * k + j] as i32);
+                // a_slice[s(col) * m(rows) + i(row)]
+                // b_slice[j(col) * n(rows) + s(row)]
+                sum += (a_slice[s * m + i] as i32) * (b_slice[j * n + s] as i32);
             }
             let round_offset = if shift > 0 { 32767 >> shift } else { 0 };
-            c_slice[i * k + j] = ((sum + round_offset) >> shift) as i16;
+            // c_slice[j(col) * m(rows) + i(row)]
+            c_slice[j * m + i] = ((sum + round_offset) >> shift) as i16;
         }
     }
 
@@ -266,9 +271,9 @@ fn benchmark_matrix_math_ex() {
         for j in 0..k {
             let mut sum = 0.0;
             for s in 0..n {
-                sum += a_slice[i * a_stride + s] * b_slice[s * b_stride + j];
+                sum += a_slice[s * a_stride + i] * b_slice[j * b_stride + s];
             }
-            c_slice[i * k + j] = sum;
+            c_slice[j * m + i] = sum;
         }
     }
     let duration_sw = start_sw.elapsed();
@@ -329,13 +334,15 @@ fn benchmark_matrix_math_fixed() {
     let c_slice = result_sw.as_mut_slice();
 
     let start_sw = Instant::now();
+    let round_offset = 32767 >> 15;
+
     for i in 0..size {
         for j in 0..size {
             let mut sum: i32 = 0;
             for s in 0..size {
-                sum += (a_slice[i * size + s] as i32) * (b_slice[s * size + j] as i32);
+                sum += (a_slice[s * size + i] as i32) * (b_slice[j * size + s] as i32);
             }
-            c_slice[i * size + j] = (sum >> 15) as i16;
+            c_slice[j * size + i] = ((sum + round_offset) >> 15) as i16;
         }
     }
     let duration_sw = start_sw.elapsed();

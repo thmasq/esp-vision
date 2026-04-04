@@ -1,6 +1,7 @@
 use crate::dsp::AlignedDMat;
 use core::arch::asm;
 
+/// Natively Column-Major hardware matrix multiplication.
 /// Requirements: m, n, k must be multiples of 4. A, B, C must be 16-byte aligned.
 #[inline(never)]
 unsafe fn dspm_mult_f32_aes3_core(
@@ -11,110 +12,101 @@ unsafe fn dspm_mult_f32_aes3_core(
     n: usize,
     k: usize,
 ) {
-    let mut _b_shift: usize;
-    let mut _k_step: usize;
-    let mut _n_count: usize;
-    let mut _x_idx: usize;
-    let mut _y_ptr: usize;
-    let mut _c_ptr_runner: usize;
-    let mut _c_col_start: usize = ptr_c as usize;
-    let mut _y_idx: usize;
+    let mut _c_runner: usize = ptr_c as usize;
+    let mut _b_runner: usize = ptr_b as usize;
+    let mut _k_loops = k;
     let mut _a_runner: usize;
+    let mut _y_ptr: usize;
+    let mut _x_ptr: usize;
+
+    let m_step = m * 4;
+    let n_bytes = n * 4;
+    let n_count = (n / 4) - 1;
+    let ptr_a_end = (ptr_a as usize) + m * 4;
 
     unsafe {
         asm!(
-            "movi.n {_b_shift}, 0",
-            "slli {_k_step}, {k}, 2",
-            "srli {_n_count}, {n}, 2",
-            "addi.n {_n_count}, {_n_count}, -1",
-            "movi.n {_x_idx}, 0",
-
-            "2:", // .loop_x_aes3
-                "movi.n {_y_idx}, 0",
+            "2:", // .loop_j (Iterate over columns of C and B)
                 "mov {_a_runner}, {ptr_a}",
-                "mov {_c_ptr_runner}, {_c_col_start}",
 
-                "3:", // .loop_y_aes3
-                    "add {_y_ptr}, {ptr_b}, {_b_shift}",
+                "3:", // .loop_i (Iterate down the rows of A and C in blocks of 4)
+                    "mov {_y_ptr}, {_b_runner}",
+                    "mov {_x_ptr}, {_a_runner}",
 
-                    // Load A row into f8-f11, Load B col into f4-f7
-                    "EE.LDF.128.IP f11, f10, f9, f8, {_a_runner}, 16",
-                    "EE.LDF.128.XP f7, f6, f5, f4, {_y_ptr}, {_k_step}",
+                    // Load 4 elements of B's column into f8-f11 (contiguous)
+                    // Load 4 elements of A's column into f4-f7 (contiguous)
+                    "EE.LDF.128.IP f11, f10, f9, f8, {_y_ptr}, 16",
+                    "EE.LDF.128.XP f7, f6, f5, f4, {_x_ptr}, {m_step}",
+
+                    // Multiply broadcast B over A
                     "mul.s f0, f4, f8",
                     "mul.s f1, f5, f8",
                     "mul.s f2, f6, f8",
                     "mul.s f3, f7, f8",
 
-                    "EE.LDF.128.XP f7, f6, f5, f4, {_y_ptr}, {_k_step}",
+                    "EE.LDF.128.XP f7, f6, f5, f4, {_x_ptr}, {m_step}",
                     "madd.s f0, f4, f9",
                     "madd.s f1, f5, f9",
                     "madd.s f2, f6, f9",
                     "madd.s f3, f7, f9",
 
-                    "EE.LDF.128.XP f7, f6, f5, f4, {_y_ptr}, {_k_step}",
+                    "EE.LDF.128.XP f7, f6, f5, f4, {_x_ptr}, {m_step}",
                     "madd.s f0, f4, f10",
                     "madd.s f1, f5, f10",
                     "madd.s f2, f6, f10",
                     "madd.s f3, f7, f10",
 
-                    "EE.LDF.128.XP f7, f6, f5, f4, {_y_ptr}, {_k_step}",
+                    "EE.LDF.128.XP f7, f6, f5, f4, {_x_ptr}, {m_step}",
                     "madd.s f0, f4, f11",
                     "madd.s f1, f5, f11",
                     "madd.s f2, f6, f11",
                     "madd.s f3, f7, f11",
 
                     // Hardware inner loop over N/4 remaining blocks
-                    "loopnez {_n_count}, 4f",
-                        "EE.LDF.128.IP f11, f10, f9, f8, {_a_runner}, 16",
+                    "loopnez {n_count}, 4f",
+                        "EE.LDF.128.IP f11, f10, f9, f8, {_y_ptr}, 16",
 
-                        "EE.LDF.128.XP f7, f6, f5, f4, {_y_ptr}, {_k_step}",
+                        "EE.LDF.128.XP f7, f6, f5, f4, {_x_ptr}, {m_step}",
                         "madd.s f0, f4, f8", "madd.s f1, f5, f8", "madd.s f2, f6, f8", "madd.s f3, f7, f8",
 
-                        "EE.LDF.128.XP f7, f6, f5, f4, {_y_ptr}, {_k_step}",
+                        "EE.LDF.128.XP f7, f6, f5, f4, {_x_ptr}, {m_step}",
                         "madd.s f0, f4, f9", "madd.s f1, f5, f9", "madd.s f2, f6, f9", "madd.s f3, f7, f9",
 
-                        "EE.LDF.128.XP f7, f6, f5, f4, {_y_ptr}, {_k_step}",
+                        "EE.LDF.128.XP f7, f6, f5, f4, {_x_ptr}, {m_step}",
                         "madd.s f0, f4, f10", "madd.s f1, f5, f10", "madd.s f2, f6, f10", "madd.s f3, f7, f10",
 
-                        "EE.LDF.128.XP f7, f6, f5, f4, {_y_ptr}, {_k_step}",
+                        "EE.LDF.128.XP f7, f6, f5, f4, {_x_ptr}, {m_step}",
                         "madd.s f0, f4, f11", "madd.s f1, f5, f11", "madd.s f2, f6, f11", "madd.s f3, f7, f11",
-                    "4:", // .loop_end_m_aes3
+                    "4:", // .loop_end_inner
 
-                    // Store 4 output floats back to Matrix C
-                    "EE.STF.128.XP f3, f2, f1, f0, {_c_ptr_runner}, {_k_step}",
+                    // Store 4 output floats contiguously to Matrix C
+                    // Because C is column-major, this natively glides down the column.
+                    "EE.STF.128.IP f3, f2, f1, f0, {_c_runner}, 16",
 
-                    "addi {_y_idx}, {_y_idx}, 1",
-
-                    // MANUAL BRANCH RELAXATION:
-                    // blt {_y_idx}, {m}, 3b -> (Invert condition, use unconditional jump)
-                    "bge {_y_idx}, {m}, 5f", // If y_idx >= m, skip jump and exit inner loop
-                    "j 3b",                  // Else, jump back to 3: (Range up to 256KB)
+                    "addi {_a_runner}, {_a_runner}, 16",
+                    "bge {_a_runner}, {ptr_a_end}, 5f",
+                    "j 3b",
                     "5:",
 
-                "addi {_c_col_start}, {_c_col_start}, 16",
-                "addi {_b_shift}, {_b_shift}, 16",
-                "addi {_x_idx}, {_x_idx}, 16",
-
-                // MANUAL BRANCH RELAXATION:
-                "bge {_x_idx}, {_k_step}, 6f",
+                // Advance B to the next column
+                "add {_b_runner}, {_b_runner}, {n_bytes}",
+                "addi {_k_loops}, {_k_loops}, -1",
+                "beqz {_k_loops}, 6f",
                 "j 2b",
                 "6:",
 
-            _b_shift = out(reg) _b_shift,
-            _k_step = out(reg) _k_step,
-            _n_count = out(reg) _n_count,
-            _x_idx = out(reg) _x_idx,
-            _y_ptr = out(reg) _y_ptr,
-            _c_ptr_runner = out(reg) _c_ptr_runner,
-            _c_col_start = inout(reg) _c_col_start,
-            _y_idx = out(reg) _y_idx,
             _a_runner = out(reg) _a_runner,
+            _y_ptr = out(reg) _y_ptr,
+            _x_ptr = out(reg) _x_ptr,
+            _c_runner = inout(reg) _c_runner,
+            _b_runner = inout(reg) _b_runner,
+            _k_loops = inout(reg) _k_loops,
 
             ptr_a = in(reg) ptr_a,
-            ptr_b = in(reg) ptr_b,
-            m = in(reg) m,
-            n = in(reg) n,
-            k = in(reg) k,
+            ptr_a_end = in(reg) ptr_a_end,
+            m_step = in(reg) m_step,
+            n_bytes = in(reg) n_bytes,
+            n_count = in(reg) n_count,
             options(nostack)
         );
     }
@@ -140,7 +132,7 @@ pub fn esp_gemm(a: &AlignedDMat<f32>, b: &AlignedDMat<f32>, c: &mut AlignedDMat<
             core::hint::assert_unchecked(ptr_b as usize % 16 == 0);
             core::hint::assert_unchecked(ptr_c as usize % 16 == 0);
 
-            dspm_mult_f32_aes3_core(ptr_b, ptr_a, ptr_c, k, n, m);
+            dspm_mult_f32_aes3_core(ptr_a, ptr_b, ptr_c, m, n, k);
         }
     } else {
         c.gemm(1.0, a, b, 0.0);
