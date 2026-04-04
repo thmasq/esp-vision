@@ -38,7 +38,7 @@ impl<T: nalgebra::Scalar + Copy> AlignedDMatExt<T> for AlignedDMat<T> {
 impl EspMatrixMath for AlignedDMat<f32> {
     fn esp_mul(&self, rhs: &Self) -> Self {
         let mut result = Self::zeros(self.nrows(), rhs.ncols());
-        crate::dsp::matrix::esp_gemm(self, rhs, &mut result);
+        crate::dsp::matrix::dspm_mult_f32::esp_gemm(self, rhs, &mut result);
         result
     }
 }

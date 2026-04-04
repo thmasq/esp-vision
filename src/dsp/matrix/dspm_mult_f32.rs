@@ -1,4 +1,4 @@
-use super::AlignedDMat;
+use crate::dsp::AlignedDMat;
 use core::arch::asm;
 
 /// Requirements: m, n, k must be multiples of 4. A, B, C must be 16-byte aligned.
@@ -91,7 +91,6 @@ unsafe fn dspm_mult_f32_aes3_core(
                     "j 3b",                  // Else, jump back to 3: (Range up to 256KB)
                     "5:",
 
-                // Replaced addi.n with addi because 16 is outside the [-1, 15] narrow range
                 "addi {_c_col_start}, {_c_col_start}, 16",
                 "addi {_b_shift}, {_b_shift}, 16",
                 "addi {_x_idx}, {_x_idx}, 16",
