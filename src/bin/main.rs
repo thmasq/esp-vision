@@ -12,7 +12,7 @@ use embassy_time::{Duration, Instant, Timer};
 use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
 use esp_hal::timer::timg::TimerGroup;
-use esp_vision::dsp::{AlignedDMat, AlignedDMatExt, EspMatrixMath};
+use esp_vision::dsp::{AlignedDMat, AlignedDMatExt, EspFixedMatrixMath, EspMatrixMath};
 use log::{error, info};
 
 extern crate alloc;
@@ -20,7 +20,7 @@ extern crate alloc;
 esp_bootloader_esp_idf::esp_app_desc!();
 
 fn test_matrix_math() {
-    info!("--- FUNCTIONAL TEST ---");
+    info!("--- FUNCTIONAL TEST (FLOAT) ---");
     info!("Initializing 4x4 test matrices...");
 
     let mut mat_a = AlignedDMat::<f32>::zeros(4, 4);
@@ -117,8 +117,62 @@ fn test_matrix_math_ex() {
     }
 }
 
+fn test_matrix_math_fixed() {
+    info!("--- FUNCTIONAL TEST (Q15 FIXED-POINT) ---");
+    info!("Initializing 8x8 fixed-point test matrices...");
+
+    let m = 8;
+    let n = 8;
+    let k = 8;
+
+    let mut mat_a = AlignedDMat::<i16>::zeros(m, n);
+    let mut mat_b = AlignedDMat::<i16>::zeros(n, k);
+
+    for i in 0..(m * n) {
+        mat_a[i] = (i as i16 * 10) % 1000;
+        mat_b[i] = (2000 - i as i16 * 5) % 1000;
+    }
+
+    let shift = 15;
+    let result_hardware = mat_a.esp_mul_fixed(&mat_b, shift);
+
+    let mut result_software = AlignedDMat::<i16>::zeros(m, k);
+    let c_slice = result_software.as_mut_slice();
+    let a_slice = mat_a.as_slice();
+    let b_slice = mat_b.as_slice();
+
+    for i in 0..m {
+        for j in 0..k {
+            let mut sum: i32 = 0;
+            for s in 0..n {
+                sum += (a_slice[i * n + s] as i32) * (b_slice[s * k + j] as i32);
+            }
+            let round_offset = if shift > 0 { 32767 >> shift } else { 0 };
+            c_slice[i * k + j] = ((sum + round_offset) >> shift) as i16;
+        }
+    }
+
+    let mut success = true;
+    for i in 0..(m * k) {
+        let diff = (result_hardware[i] as i32 - result_software[i] as i32).abs();
+        if diff > 1 {
+            error!(
+                "MISMATCH FIXED at index {}: Hardware = {}, Software = {}",
+                i, result_hardware[i], result_software[i]
+            );
+            success = false;
+        }
+    }
+
+    if success {
+        info!("SUCCESS: Assembly Vector Math matches fixed-point baseline");
+    } else {
+        error!("FAILED: Fixed-point assembly logic has an error.");
+    }
+}
+
 fn benchmark_matrix_math() {
-    info!("--- BENCHMARK TEST ---");
+    info!("--- BENCHMARK TEST (FLOAT) ---");
     let size = 64;
 
     info!("Allocating {}x{} matrices for benchmarking...", size, size);
@@ -241,6 +295,72 @@ fn benchmark_matrix_math_ex() {
     info!("===============================================");
 }
 
+fn benchmark_matrix_math_fixed() {
+    info!("--- BENCHMARK TEST (Q15 FIXED-POINT) ---");
+    let size = 64;
+
+    info!(
+        "Allocating {}x{} fixed-point matrices for benchmarking...",
+        size, size
+    );
+
+    let mut mat_a = AlignedDMat::<i16>::zeros(size, size);
+    let mut mat_b = AlignedDMat::<i16>::zeros(size, size);
+
+    for i in 0..(size * size) {
+        mat_a[i] = (i as i16 * 17) % 2000;
+        mat_b[i] = (3000 - i as i16 * 13) % 2000;
+    }
+
+    info!("Executing Vector Accelerated Multiplication (Xtensa qacc)...");
+    let start_hw = Instant::now();
+    let result_hw = mat_a.esp_mul_fixed(&mat_b, 15);
+    let duration_hw = start_hw.elapsed();
+    info!(
+        "-> Hardware FIXED Time: {} ms ({} microseconds)",
+        duration_hw.as_millis(),
+        duration_hw.as_micros()
+    );
+
+    info!("Executing ANSI Software Fixed-Point Multiplication...");
+    let mut result_sw = AlignedDMat::<i16>::zeros(size, size);
+    let a_slice = mat_a.as_slice();
+    let b_slice = mat_b.as_slice();
+    let c_slice = result_sw.as_mut_slice();
+
+    let start_sw = Instant::now();
+    for i in 0..size {
+        for j in 0..size {
+            let mut sum: i32 = 0;
+            for s in 0..size {
+                sum += (a_slice[i * size + s] as i32) * (b_slice[s * size + j] as i32);
+            }
+            c_slice[i * size + j] = (sum >> 15) as i16;
+        }
+    }
+    let duration_sw = start_sw.elapsed();
+    info!(
+        "-> Software FIXED Time: {} ms ({} microseconds)",
+        duration_sw.as_millis(),
+        duration_sw.as_micros()
+    );
+
+    let mut diff_accum: i32 = 0;
+    for i in 0..(size * size) {
+        diff_accum += (result_hw[i] as i32 - result_sw[i] as i32).abs();
+    }
+
+    info!(
+        "Benchmark FIXED Result Consistency Check (Cumulative Rounding Drift): {}",
+        diff_accum
+    );
+
+    let perf_gain = duration_sw.as_micros() as f32 / duration_hw.as_micros() as f32;
+    info!("===============================================");
+    info!(">>> FIXED PERFORMANCE GAIN: {:.2}x FASTER <<<", perf_gain);
+    info!("===============================================");
+}
+
 #[allow(
     clippy::large_stack_frames,
     reason = "it's not unusual to allocate larger buffers etc. in main"
@@ -261,8 +381,11 @@ async fn main(spawner: Spawner) -> ! {
 
     test_matrix_math();
     test_matrix_math_ex();
+    test_matrix_math_fixed();
+
     benchmark_matrix_math();
     benchmark_matrix_math_ex();
+    benchmark_matrix_math_fixed();
 
     let _ = spawner;
 

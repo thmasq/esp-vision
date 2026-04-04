@@ -15,7 +15,7 @@ pub trait AlignedDMatExt<T> {
     fn from_slice(nrows: usize, ncols: usize, slice: &[T]) -> Self;
 }
 
-/// Extension trait exposing hardware accelerated math routines.
+/// Extension trait exposing hardware accelerated math routines (Floating Point).
 pub trait EspMatrixMath {
     /// Multiplies `self` by `rhs` utilizing ESP32-S3 hardware acceleration when possible.
     fn esp_mul(&self, rhs: &Self) -> Self;
@@ -32,6 +32,14 @@ pub trait EspMatrixMath {
         n: usize,
         k: usize,
     ) -> Self;
+}
+
+/// Extension trait exposing hardware accelerated fixed-point math routines (Q-format).
+pub trait EspFixedMatrixMath {
+    /// Multiplies `self` by `rhs` using ESP32-S3 vector instructions.
+    /// The `shift` parameter controls the bit-shift applied after multiplication
+    /// to maintain the chosen Q-format (e.g., Q15 typically uses a shift of 15).
+    fn esp_mul_fixed(&self, rhs: &Self, shift: i32) -> Self;
 }
 
 impl<T: nalgebra::Scalar + Copy> AlignedDMatExt<T> for AlignedDMat<T> {
@@ -79,6 +87,23 @@ impl EspMatrixMath for AlignedDMat<f32> {
             k,
         );
 
+        result
+    }
+}
+
+// Implement the accelerated vector operations exclusively for i16 matrices
+impl EspFixedMatrixMath for AlignedDMat<i16> {
+    fn esp_mul_fixed(&self, rhs: &Self, shift: i32) -> Self {
+        let mut result = Self::zeros(self.nrows(), rhs.ncols());
+        crate::dsp::matrix::dspm_mult_s16::esp_gemm_s16(
+            self.as_slice(),
+            rhs.as_slice(),
+            result.as_mut_slice(),
+            self.nrows(),
+            self.ncols(),
+            rhs.ncols(),
+            shift,
+        );
         result
     }
 }
