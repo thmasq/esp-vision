@@ -7,7 +7,7 @@ struct AlignedArray([i16; 8]);
 /// Requirements:
 /// - m must be a multiple of 8.
 /// - A, B, C pointers must be 16-byte aligned.
-#[inline(never)]
+#[inline(always)]
 pub unsafe fn dspm_mult_s16_aes3_core(
     ptr_a: *const i16,
     ptr_b: *const i16,
@@ -86,6 +86,9 @@ pub unsafe fn dspm_mult_s16_aes3_core(
                     n_half = in(reg) n_half,
                     a_stride_bytes = in(reg) a_stride_bytes,
                     qacc_shift = in(reg) qacc_shift,
+
+                    // In case LLVM ever adds these registers, tell it we are destroying q0, q1, q2, and qacc
+                    // out("q0") _, out("q1") _, out("q2") _, out("qacc") _,
 
                     options(nostack)
                 );

@@ -22,12 +22,17 @@ pub trait AlignedDMatExt<T> {
 
 /// Extension trait exposing hardware accelerated math routines (Floating Point).
 pub trait EspMatrixMath {
-    /// Multiplies `self` by `rhs` utilizing ESP32-S3 hardware acceleration when possible.
+    /// Multiplies `self` by `rhs` utilizing ESP32-S3 hardware acceleration.
+    /// Allocates and returns a new `AlignedDMat`.
     fn esp_mul(&self, rhs: &Self) -> Self;
+
+    /// Multiplies `self` by `rhs`, writing the result into a pre-allocated `out` matrix.
+    /// Use this in hot loops to avoid heap allocation overhead.
+    fn esp_mul_to(&self, rhs: &Self, out: &mut Self);
 
     /// Multiplies a sub-region of `self` by a sub-region of `rhs` using ESP32-S3 SIMD.
     /// `a_stride` and `b_stride` are the total columns of the parent buffers.
-    /// Returns a new, contiguous `AlignedDMat` of size (m x k).
+    /// Allocates and returns a new `AlignedDMat` of size (m x k).
     fn esp_mul_ex(
         &self,
         a_stride: usize,
@@ -37,14 +42,31 @@ pub trait EspMatrixMath {
         n: usize,
         k: usize,
     ) -> Self;
+
+    /// Multiplies a sub-region of `self` by a sub-region of `rhs` using ESP32-S3 SIMD,
+    /// writing directly to a pre-allocated `out` matrix.
+    fn esp_mul_ex_to(
+        &self,
+        a_stride: usize,
+        rhs: &Self,
+        b_stride: usize,
+        out: &mut Self,
+        m: usize,
+        n: usize,
+        k: usize,
+    );
 }
 
 /// Extension trait exposing hardware accelerated fixed-point math routines (Q-format).
 pub trait EspFixedMatrixMath {
     /// Multiplies `self` by `rhs` using ESP32-S3 vector instructions.
-    /// The `shift` parameter controls the bit-shift applied after multiplication
-    /// to maintain the chosen Q-format (e.g., Q15 typically uses a shift of 15).
+    /// Allocates and returns a new `AlignedDMat`.
+    /// The `shift` parameter controls the bit-shift applied after multiplication.
     fn esp_mul_fixed(&self, rhs: &Self, shift: i32) -> Self;
+
+    /// Multiplies `self` by `rhs` using ESP32-S3 vector instructions,
+    /// writing directly to a pre-allocated `out` matrix.
+    fn esp_mul_fixed_to(&self, rhs: &Self, shift: i32, out: &mut Self);
 }
 
 impl<T: nalgebra::Scalar + Copy + Default> AlignedDMatExt<T> for AlignedDMat<T> {
@@ -77,20 +99,41 @@ impl<T: nalgebra::Scalar + Copy + Default> AlignedDMatExt<T> for AlignedDMat<T> 
 // Implement the accelerated operations exclusively for f32 matrices
 impl EspMatrixMath for AlignedDMat<f32> {
     fn esp_mul(&self, rhs: &Self) -> Self {
+        let mut result = Self::zeros(self.nrows(), rhs.ncols());
+        self.esp_mul_to(rhs, &mut result);
+        result
+    }
+
+    fn esp_mul_to(&self, rhs: &Self, out: &mut Self) {
         let m = self.nrows();
         let n = self.ncols();
         let k = rhs.ncols();
 
+        // Safety checks
+        assert_eq!(
+            n,
+            rhs.nrows(),
+            "Matrix dimensions mismatch for multiplication!"
+        );
+        assert_eq!(
+            out.nrows(),
+            m,
+            "Output matrix has incorrect number of rows!"
+        );
+        assert_eq!(
+            out.ncols(),
+            k,
+            "Output matrix has incorrect number of columns!"
+        );
+
         let a_stride = self.data.physical_stride;
         let b_stride = rhs.data.physical_stride;
+        let c_stride = out.data.physical_stride;
 
         // Hardware sees the padded boundaries
         let m_pad = round_up(m, 4);
         let n_pad = round_up(n, 4);
         let k_pad = round_up(k, 4);
-
-        let mut result = Self::zeros(m, k);
-        let c_stride = result.data.physical_stride;
 
         unsafe {
             // Using `esp_gemm_ex` uniformly handles the non-contiguous storage gaps
@@ -99,15 +142,13 @@ impl EspMatrixMath for AlignedDMat<f32> {
                 a_stride,
                 rhs.data.as_slice_unchecked(),
                 b_stride,
-                result.data.as_mut_slice_unchecked(),
+                out.data.as_mut_slice_unchecked(),
                 c_stride,
                 m_pad,
                 n_pad,
                 k_pad,
             );
         }
-
-        result
     }
 
     fn esp_mul_ex(
@@ -120,8 +161,32 @@ impl EspMatrixMath for AlignedDMat<f32> {
         k: usize,
     ) -> Self {
         let mut result = Self::zeros(m, k);
-        let c_stride = result.data.physical_stride;
+        self.esp_mul_ex_to(a_stride, rhs, b_stride, &mut result, m, n, k);
+        result
+    }
 
+    fn esp_mul_ex_to(
+        &self,
+        a_stride: usize,
+        rhs: &Self,
+        b_stride: usize,
+        out: &mut Self,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) {
+        assert_eq!(
+            out.nrows(),
+            m,
+            "Output matrix has incorrect number of rows!"
+        );
+        assert_eq!(
+            out.ncols(),
+            k,
+            "Output matrix has incorrect number of columns!"
+        );
+
+        let c_stride = out.data.physical_stride;
         let m_pad = round_up(m, 4);
         let n_pad = round_up(n, 4);
         let k_pad = round_up(k, 4);
@@ -132,31 +197,49 @@ impl EspMatrixMath for AlignedDMat<f32> {
                 a_stride,
                 rhs.data.as_slice_unchecked(),
                 b_stride,
-                result.data.as_mut_slice_unchecked(),
+                out.data.as_mut_slice_unchecked(),
                 c_stride,
                 m_pad,
                 n_pad,
                 k_pad,
             );
         }
-
-        result
     }
 }
 
 // Implement the accelerated vector operations exclusively for i16 matrices
 impl EspFixedMatrixMath for AlignedDMat<i16> {
     fn esp_mul_fixed(&self, rhs: &Self, shift: i32) -> Self {
+        let mut result = Self::zeros(self.nrows(), rhs.ncols());
+        self.esp_mul_fixed_to(rhs, shift, &mut result);
+        result
+    }
+
+    fn esp_mul_fixed_to(&self, rhs: &Self, shift: i32, out: &mut Self) {
         let m = self.nrows();
         let n = self.ncols();
         let k = rhs.ncols();
+
+        assert_eq!(
+            n,
+            rhs.nrows(),
+            "Matrix dimensions mismatch for multiplication!"
+        );
+        assert_eq!(
+            out.nrows(),
+            m,
+            "Output matrix has incorrect number of rows!"
+        );
+        assert_eq!(
+            out.ncols(),
+            k,
+            "Output matrix has incorrect number of columns!"
+        );
 
         // Q15 fixed-point multiplies require multiples of 8 for SIMD unrolling
         let m_pad = round_up(m, 8);
         let n_pad = round_up(n, 8);
         let k_pad = round_up(k, 8);
-
-        let mut result = Self::zeros(m, k);
 
         unsafe {
             // Because our arrays are zero-padded physically, we can pass the padded
@@ -165,14 +248,12 @@ impl EspFixedMatrixMath for AlignedDMat<i16> {
             crate::dsp::matrix::dspm_mult_s16::esp_gemm_s16(
                 self.data.as_slice_unchecked(),
                 rhs.data.as_slice_unchecked(),
-                result.data.as_mut_slice_unchecked(),
+                out.data.as_mut_slice_unchecked(),
                 m_pad,
                 n_pad,
                 k_pad,
                 shift,
             );
         }
-
-        result
     }
 }

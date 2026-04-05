@@ -5,7 +5,7 @@ use core::arch::asm;
 /// - m, n, k must be multiples of 4.
 /// - a_stride, b_stride, c_stride must be multiples of 4 and >= their respective column lengths.
 /// - A, B, C pointers must be 16-byte aligned.
-#[inline(never)]
+#[inline(always)]
 pub unsafe fn dspm_mult_ex_f32_aes3_core(
     ptr_a: *const f32,
     ptr_b: *const f32,
@@ -119,6 +119,10 @@ pub unsafe fn dspm_mult_ex_f32_aes3_core(
             b_stride_bytes = in(reg) b_stride_bytes,
             c_pad_bytes = in(reg) c_pad_bytes,
             n_count = in(reg) n_count,
+
+            out("f0") _, out("f1") _, out("f2") _, out("f3") _,
+            out("f4") _, out("f5") _, out("f6") _, out("f7") _,
+            out("f8") _, out("f9") _, out("f10") _, out("f11") _,
 
             options(nostack)
         );

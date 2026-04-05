@@ -389,6 +389,67 @@ fn benchmark_matrix_math_fixed() {
     info!("===============================================");
 }
 
+fn benchmark_matrix_math_small_hot_loops() {
+    info!("--- BENCHMARK TEST (SMALL MATRICES HOT LOOP) ---");
+    let sizes = [4, 6, 8, 10];
+    let iterations = 5000;
+
+    for &size in &sizes {
+        info!(
+            "Allocating and benchmarking {}x{} matrix over {} iterations...",
+            size, size, iterations
+        );
+
+        let mut mat_a = AlignedDMat::<f32>::zeros(size, size);
+        let mut mat_b = AlignedDMat::<f32>::zeros(size, size);
+
+        let mut result_hw = AlignedDMat::<f32>::zeros(size, size);
+        let mut result_sw = AlignedDMat::<f32>::zeros(size, size);
+
+        for c in 0..size {
+            for r in 0..size {
+                let i = c * size + r;
+                mat_a[(r, c)] = i as f32 % 7.0;
+                mat_b[(r, c)] = (size * size - i) as f32 % 11.0;
+            }
+        }
+
+        let start_hw = Instant::now();
+        for _ in 0..iterations {
+            mat_a.esp_mul_to(&mat_b, &mut result_hw);
+        }
+        let duration_hw = start_hw.elapsed();
+        info!(
+            "-> Hardware {}x{} Time: {} ms ({} microseconds)",
+            size,
+            size,
+            duration_hw.as_millis(),
+            duration_hw.as_micros()
+        );
+
+        let start_sw = Instant::now();
+        for _ in 0..iterations {
+            result_sw.gemm(1.0, &mat_a, &mat_b, 0.0);
+        }
+        let duration_sw = start_sw.elapsed();
+        info!(
+            "-> Software {}x{} Time: {} ms ({} microseconds)",
+            size,
+            size,
+            duration_sw.as_millis(),
+            duration_sw.as_micros()
+        );
+
+        let perf_gain = duration_sw.as_micros() as f32 / duration_hw.as_micros() as f32;
+        info!("===============================================");
+        info!(
+            ">>> {}x{} HOT LOOP GAIN: {:.2}x FASTER <<<",
+            size, size, perf_gain
+        );
+        info!("===============================================");
+    }
+}
+
 #[allow(
     clippy::large_stack_frames,
     reason = "it's not unusual to allocate larger buffers etc. in main"
@@ -414,6 +475,8 @@ async fn main(spawner: Spawner) -> ! {
     benchmark_matrix_math();
     benchmark_matrix_math_ex();
     benchmark_matrix_math_fixed();
+
+    benchmark_matrix_math_small_hot_loops();
 
     let _ = spawner;
 
