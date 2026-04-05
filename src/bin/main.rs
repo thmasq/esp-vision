@@ -12,7 +12,11 @@ use embassy_time::{Duration, Instant, Timer};
 use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
 use esp_hal::timer::timg::TimerGroup;
-use esp_vision::dsp::{AlignedDMat, AlignedDMatExt, EspFixedMatrixMath, EspMatrixMath};
+
+use esp_vision::dsp::{
+    AlignedDMat, AlignedDMatExt, AlignedDVec, AlignedDVecExt, EspDotProd, EspFixedMatrixMath,
+    EspMatrixMath,
+};
 use log::{error, info};
 
 extern crate alloc;
@@ -185,6 +189,35 @@ fn test_matrix_math_fixed() {
         info!("SUCCESS: Assembly Vector Math matches fixed-point baseline");
     } else {
         error!("FAILED: Fixed-point assembly logic has an error.");
+    }
+}
+
+fn test_vector_dotprod() {
+    info!("--- FUNCTIONAL TEST (VECTOR DOT PRODUCT) ---");
+
+    let size = 15;
+    info!("Initializing vector of size {}...", size);
+
+    let mut vec_a = AlignedDVec::<f32>::zeros(size);
+    let mut vec_b = AlignedDVec::<f32>::zeros(size);
+
+    for i in 0..size {
+        vec_a[(i, 0)] = (i + 1) as f32;
+        vec_b[(i, 0)] = (size - i) as f32;
+    }
+
+    let result_hardware = vec_a.esp_dot(&vec_b);
+    let result_software = vec_a.dot(&vec_b);
+
+    let diff = (result_hardware - result_software).abs();
+
+    if diff > 0.0001 {
+        error!(
+            "FAILED: MISMATCH Hardware = {}, Software = {}",
+            result_hardware, result_software
+        );
+    } else {
+        info!("SUCCESS: Assembly SIMD dot product matches standard nalgebra dot");
     }
 }
 
@@ -450,6 +483,65 @@ fn benchmark_matrix_math_small_hot_loops() {
     }
 }
 
+fn benchmark_vector_dotprod() {
+    info!("--- BENCHMARK TEST (VECTOR DOT PRODUCT) ---");
+    let size = 1024;
+    let iterations = 10000;
+
+    info!(
+        "Allocating {}x1 vectors for benchmarking over {} iterations...",
+        size, iterations
+    );
+
+    let mut vec_a = AlignedDVec::<f32>::zeros(size);
+    let mut vec_b = AlignedDVec::<f32>::zeros(size);
+
+    for i in 0..size {
+        vec_a[(i, 0)] = i as f32 % 7.0;
+        vec_b[(i, 0)] = (size - i) as f32 % 11.0;
+    }
+
+    info!("Executing Hardware Accelerated Dot Product (Xtensa SIMD)...");
+    let start_hw = Instant::now();
+    let mut hw_res = 0.0;
+    for _ in 0..iterations {
+        hw_res = vec_a.esp_dot(&vec_b);
+    }
+    let duration_hw = start_hw.elapsed();
+    info!(
+        "-> Hardware Time: {} ms ({} microseconds)",
+        duration_hw.as_millis(),
+        duration_hw.as_micros()
+    );
+
+    info!("Executing ANSI Software Dot Product (nalgebra default)...");
+    let start_sw = Instant::now();
+    let mut sw_res = 0.0;
+    for _ in 0..iterations {
+        sw_res = vec_a.dot(&vec_b);
+    }
+    let duration_sw = start_sw.elapsed();
+    info!(
+        "-> Software Time: {} ms ({} microseconds)",
+        duration_sw.as_millis(),
+        duration_sw.as_micros()
+    );
+
+    let diff = (hw_res - sw_res).abs();
+    info!(
+        "Benchmark Result Consistency Check (Error magnitude): {}",
+        diff
+    );
+
+    let perf_gain = duration_sw.as_micros() as f32 / duration_hw.as_micros() as f32;
+    info!("===============================================");
+    info!(
+        ">>> DOT PRODUCT PERFORMANCE GAIN: {:.2}x FASTER <<<",
+        perf_gain
+    );
+    info!("===============================================");
+}
+
 #[allow(
     clippy::large_stack_frames,
     reason = "it's not unusual to allocate larger buffers etc. in main"
@@ -471,12 +563,13 @@ async fn main(spawner: Spawner) -> ! {
     test_matrix_math();
     test_matrix_math_ex();
     test_matrix_math_fixed();
+    test_vector_dotprod();
 
     benchmark_matrix_math();
     benchmark_matrix_math_ex();
     benchmark_matrix_math_fixed();
-
     benchmark_matrix_math_small_hot_loops();
+    benchmark_vector_dotprod();
 
     let _ = spawner;
 

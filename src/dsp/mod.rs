@@ -1,10 +1,11 @@
 pub mod alloc;
 pub mod matrix;
 pub mod storage;
+pub mod vector;
 
 use alloc::AlignedVec;
 use nalgebra::base::storage::{RawStorage, RawStorageMut};
-use nalgebra::{Dyn, Matrix};
+use nalgebra::{Dim, Dyn, Matrix, U1};
 use storage::EspAlignedStorage;
 
 const fn round_up(val: usize, align: usize) -> usize {
@@ -14,10 +15,19 @@ const fn round_up(val: usize, align: usize) -> usize {
 /// A dynamically sized, 16-byte aligned matrix specifically designed for `esp-dsp` SIMD acceleration.
 pub type AlignedDMat<T> = Matrix<T, Dyn, Dyn, EspAlignedStorage<T, Dyn, Dyn>>;
 
-/// Extension trait to provide constructor methods.
+/// A dynamically sized, 16-byte aligned column vector specifically designed for `esp-dsp` SIMD acceleration.
+pub type AlignedDVec<T> = Matrix<T, Dyn, U1, EspAlignedStorage<T, Dyn, U1>>;
+
+/// Extension trait to provide constructor methods for matrices.
 pub trait AlignedDMatExt<T> {
     fn zeros(nrows: usize, ncols: usize) -> Self;
     fn from_slice(nrows: usize, ncols: usize, slice: &[T]) -> Self;
+}
+
+/// Extension trait to provide constructor methods for column vectors.
+pub trait AlignedDVecExt<T> {
+    fn zeros(nrows: usize) -> Self;
+    fn from_slice(nrows: usize, slice: &[T]) -> Self;
 }
 
 /// Extension trait exposing hardware accelerated math routines (Floating Point).
@@ -57,6 +67,12 @@ pub trait EspMatrixMath {
     );
 }
 
+/// Extension trait to add hardware-accelerated dot products to nalgebra vectors.
+pub trait EspDotProd {
+    /// Computes the dot product using ESP32-S3 PIE SIMD instructions.
+    fn esp_dot(&self, other: &Self) -> f32;
+}
+
 /// Extension trait exposing hardware accelerated fixed-point math routines (Q-format).
 pub trait EspFixedMatrixMath {
     /// Multiplies `self` by `rhs` using ESP32-S3 vector instructions.
@@ -93,6 +109,55 @@ impl<T: nalgebra::Scalar + Copy + Default> AlignedDMatExt<T> for AlignedDMat<T> 
             }
         }
         mat
+    }
+}
+
+impl<T: nalgebra::Scalar + Copy + Default> AlignedDVecExt<T> for AlignedDVec<T> {
+    fn zeros(nrows: usize) -> Self {
+        let align = if core::mem::size_of::<T>() == 2 { 8 } else { 4 };
+        let padded_rows = round_up(nrows, align);
+
+        let data = AlignedVec::zeros(padded_rows);
+        let storage = EspAlignedStorage::new(Dyn(nrows), U1, data, padded_rows);
+        Self::from_data(storage)
+    }
+
+    fn from_slice(nrows: usize, slice: &[T]) -> Self {
+        let mut vec = Self::zeros(nrows);
+        for r in 0..nrows {
+            vec[(r, 0)] = slice[r];
+        }
+        vec
+    }
+}
+
+impl<R: Dim> EspDotProd for Matrix<f32, R, U1, EspAlignedStorage<f32, R, U1>> {
+    #[inline(always)]
+    fn esp_dot(&self, other: &Self) -> f32 {
+        assert_eq!(
+            self.nrows(),
+            other.nrows(),
+            "Vectors must have the same mathematical length"
+        );
+
+        assert_eq!(
+            self.data.physical_stride, other.data.physical_stride,
+            "Vectors must have the same padded physical stride"
+        );
+
+        unsafe {
+            let a_ptr = self.data.ptr();
+            let b_ptr = other.data.ptr();
+
+            core::hint::assert_unchecked(a_ptr as usize % 16 == 0);
+            core::hint::assert_unchecked(b_ptr as usize % 16 == 0);
+
+            let padded_len = self.data.physical_stride;
+
+            crate::dsp::vector::dsps_dotprod_f32::dsps_dotprod_f32_aes3_core(
+                a_ptr, b_ptr, padded_len,
+            )
+        }
     }
 }
 
