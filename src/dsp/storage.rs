@@ -1,8 +1,8 @@
 use nalgebra::base::allocator::Allocator;
 use nalgebra::base::default_allocator::DefaultAllocator;
 use nalgebra::base::dimension::{Dim, U1};
-use nalgebra::base::storage::{IsContiguous, Owned, RawStorage, RawStorageMut, Storage};
-use nalgebra::{OMatrix, Scalar};
+use nalgebra::base::storage::{Owned, RawStorage, RawStorageMut, Storage};
+use nalgebra::{Dyn, OMatrix, Scalar};
 
 use super::alloc::AlignedVec;
 
@@ -11,22 +11,23 @@ pub struct EspAlignedStorage<T, R: Dim, C: Dim> {
     data: AlignedVec<T>,
     nrows: R,
     ncols: C,
+    pub physical_stride: usize,
 }
 
 impl<T, R: Dim, C: Dim> EspAlignedStorage<T, R, C> {
-    pub fn new(nrows: R, ncols: C, data: AlignedVec<T>) -> Self {
-        assert_eq!(
-            nrows.value() * ncols.value(),
-            data.len(),
-            "Dimension mismatch"
-        );
-        Self { data, nrows, ncols }
+    pub fn new(nrows: R, ncols: C, data: AlignedVec<T>, physical_stride: usize) -> Self {
+        Self {
+            data,
+            nrows,
+            ncols,
+            physical_stride,
+        }
     }
 }
 
 unsafe impl<T, R: Dim, C: Dim> RawStorage<T, R, C> for EspAlignedStorage<T, R, C> {
     type RStride = U1;
-    type CStride = R;
+    type CStride = Dyn;
 
     #[inline]
     fn ptr(&self) -> *const T {
@@ -40,12 +41,12 @@ unsafe impl<T, R: Dim, C: Dim> RawStorage<T, R, C> for EspAlignedStorage<T, R, C
 
     #[inline]
     fn strides(&self) -> (Self::RStride, Self::CStride) {
-        (U1, self.nrows.clone())
+        (U1, Dyn(self.physical_stride))
     }
 
     #[inline]
     fn is_contiguous(&self) -> bool {
-        true
+        self.nrows.value() == self.physical_stride
     }
 
     #[inline]
@@ -80,12 +81,13 @@ unsafe impl<T: Scalar, R: Dim, C: Dim> Storage<T, R, C> for EspAlignedStorage<T,
     where
         DefaultAllocator: Allocator<R, C>,
     {
-        OMatrix::<T, R, C>::from_iterator_generic(
-            self.nrows.clone(),
-            self.ncols.clone(),
-            self.data.iter().cloned(),
-        )
-        .data
+        let iter = (0..self.ncols.value()).flat_map(|c| {
+            let start = c * self.physical_stride;
+            let end = start + self.nrows.value();
+            self.data[start..end].iter().cloned()
+        });
+
+        OMatrix::<T, R, C>::from_iterator_generic(self.nrows.clone(), self.ncols.clone(), iter).data
     }
 
     #[inline]
@@ -93,5 +95,3 @@ unsafe impl<T: Scalar, R: Dim, C: Dim> Storage<T, R, C> for EspAlignedStorage<T,
         core::mem::forget(self.data);
     }
 }
-
-unsafe impl<T, R: Dim, C: Dim> IsContiguous for EspAlignedStorage<T, R, C> {}

@@ -125,10 +125,14 @@ pub unsafe fn dspm_mult_ex_f32_aes3_core(
     }
 }
 
-/// Safely multiply two extended/padded aligned matrices.
-/// In column-major layout, `stride` (`lda`, `ldb`, `ldc`) refers to the distance
-/// in elements between the start of one column and the next.
-pub fn esp_gemm_ex(
+/// Multiplies two extended/padded aligned matrices using ESP32-S3 SIMD.
+/// In column-major layout, `stride` refers to the distance in elements between columns.
+///
+/// # Safety
+/// The caller must ensure that:
+/// - `m`, `n`, `k` and all strides are multiples of 4.
+/// - Slices `a`, `b`, and `c` point to 16-byte aligned memory.
+pub unsafe fn esp_gemm_ex(
     a: &[f32],
     a_stride: usize,
     b: &[f32],
@@ -139,15 +143,15 @@ pub fn esp_gemm_ex(
     n: usize,
     k: usize,
 ) {
-    assert!(
+    debug_assert!(
         m % 4 == 0 && n % 4 == 0 && k % 4 == 0,
         "Dimensions must be multiples of 4"
     );
-    assert!(
+    debug_assert!(
         a_stride % 4 == 0 && b_stride % 4 == 0 && c_stride % 4 == 0,
         "Strides must be multiples of 4"
     );
-    assert!(
+    debug_assert!(
         a_stride >= m && b_stride >= n && c_stride >= m,
         "Stride cannot be smaller than the matrix column length"
     );
@@ -156,11 +160,13 @@ pub fn esp_gemm_ex(
     let ptr_b = b.as_ptr();
     let ptr_c = c.as_mut_ptr();
 
-    if ptr_a as usize % 16 == 0 && ptr_b as usize % 16 == 0 && ptr_c as usize % 16 == 0 {
-        unsafe {
-            dspm_mult_ex_f32_aes3_core(ptr_a, ptr_b, ptr_c, m, n, k, a_stride, b_stride, c_stride);
-        }
-    } else {
-        panic!("Extended S3 Matrix multiplication requires 16-byte aligned pointers.");
+    unsafe {
+        core::hint::assert_unchecked(ptr_a as usize % 16 == 0);
+        core::hint::assert_unchecked(ptr_b as usize % 16 == 0);
+        core::hint::assert_unchecked(ptr_c as usize % 16 == 0);
     }
+
+    unsafe {
+        dspm_mult_ex_f32_aes3_core(ptr_a, ptr_b, ptr_c, m, n, k, a_stride, b_stride, c_stride)
+    };
 }

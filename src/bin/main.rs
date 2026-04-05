@@ -26,9 +26,12 @@ fn test_matrix_math() {
     let mut mat_a = AlignedDMat::<f32>::zeros(4, 4);
     let mut mat_b = AlignedDMat::<f32>::zeros(4, 4);
 
-    for i in 0..16 {
-        mat_a[i] = (i + 1) as f32;
-        mat_b[i] = (16 - i) as f32;
+    for c in 0..4 {
+        for r in 0..4 {
+            let i = c * 4 + r;
+            mat_a[(r, c)] = (i + 1) as f32;
+            mat_b[(r, c)] = (16 - i) as f32;
+        }
     }
 
     let result_hardware = mat_a.esp_mul(&mat_b);
@@ -37,14 +40,19 @@ fn test_matrix_math() {
     result_software.gemm(1.0, &mat_a, &mat_b, 0.0);
 
     let mut success = true;
-    for i in 0..16 {
-        let diff = (result_hardware[i] - result_software[i]).abs();
-        if diff > 0.0001 {
-            error!(
-                "MISMATCH at index {}: Hardware = {}, Software = {}",
-                i, result_hardware[i], result_software[i]
-            );
-            success = false;
+    for c in 0..4 {
+        for r in 0..4 {
+            let diff = (result_hardware[(r, c)] - result_software[(r, c)]).abs();
+            if diff > 0.0001 {
+                error!(
+                    "MISMATCH at (row: {}, col: {}): Hardware = {}, Software = {}",
+                    r,
+                    c,
+                    result_hardware[(r, c)],
+                    result_software[(r, c)]
+                );
+                success = false;
+            }
         }
     }
 
@@ -65,50 +73,46 @@ fn test_matrix_math_ex() {
     let n = 4;
     let k = 4;
 
-    let mut mat_a = AlignedDMat::<f32>::zeros(8, 8); // 64 elements
-    let mut mat_b = AlignedDMat::<f32>::zeros(8, 8); // 64 elements
+    let mut mat_a = AlignedDMat::<f32>::zeros(8, 8);
+    let mut mat_b = AlignedDMat::<f32>::zeros(8, 8);
 
-    let a_slice_mut = mat_a.as_mut_slice();
-    for i in 0..64 {
-        a_slice_mut[i] = (i + 1) as f32;
-    }
-
-    let b_slice_mut = mat_b.as_mut_slice();
-    for i in 0..64 {
-        b_slice_mut[i] = (64 - i) as f32;
+    for c in 0..8 {
+        for r in 0..8 {
+            let i = c * 8 + r;
+            mat_a[(r, c)] = (i + 1) as f32;
+            mat_b[(r, c)] = (64 - i) as f32;
+        }
     }
 
     let result_hardware = mat_a.esp_mul_ex(a_stride, &mat_b, b_stride, m, n, k);
 
     let mut result_software = AlignedDMat::<f32>::zeros(m, k);
-    let c_slice = result_software.as_mut_slice();
 
-    let a_slice = mat_a.as_slice();
-    let b_slice = mat_b.as_slice();
-
-    // Manual column-major math matching the new SIMD behavior
+    // Manual math leveraging standard (row, col) indexing
     for i in 0..m {
         for j in 0..k {
             let mut sum = 0.0;
             for s in 0..n {
-                // Column-major indexing: slice[col * stride + row]
-                sum += a_slice[s * a_stride + i] * b_slice[j * b_stride + s];
+                sum += mat_a[(i, s)] * mat_b[(s, j)];
             }
-            // c_slice natively has a stride of `m` (output rows)
-            c_slice[j * m + i] = sum;
+            result_software[(i, j)] = sum;
         }
     }
 
     let mut success = true;
-    let res_hw_slice = result_hardware.as_slice();
-    for i in 0..(m * k) {
-        let diff = (res_hw_slice[i] - c_slice[i]).abs();
-        if diff > 0.0001 {
-            error!(
-                "MISMATCH EX at index {}: Hardware = {}, Software = {}",
-                i, res_hw_slice[i], c_slice[i]
-            );
-            success = false;
+    for j in 0..k {
+        for i in 0..m {
+            let diff = (result_hardware[(i, j)] - result_software[(i, j)]).abs();
+            if diff > 0.0001 {
+                error!(
+                    "MISMATCH EX at (row: {}, col: {}): Hardware = {}, Software = {}",
+                    i,
+                    j,
+                    result_hardware[(i, j)],
+                    result_software[(i, j)]
+                );
+                success = false;
+            }
         }
     }
 
@@ -130,42 +134,50 @@ fn test_matrix_math_fixed() {
     let mut mat_a = AlignedDMat::<i16>::zeros(m, n);
     let mut mat_b = AlignedDMat::<i16>::zeros(n, k);
 
-    for i in 0..(m * n) {
-        mat_a[i] = (i as i16 * 10) % 1000;
-        mat_b[i] = (2000 - i as i16 * 5) % 1000;
+    for c in 0..n {
+        for r in 0..m {
+            let i = c * m + r;
+            mat_a[(r, c)] = (i as i16 * 10) % 1000;
+        }
+    }
+
+    for c in 0..k {
+        for r in 0..n {
+            let i = c * n + r;
+            mat_b[(r, c)] = (2000 - i as i16 * 5) % 1000;
+        }
     }
 
     let shift = 15;
     let result_hardware = mat_a.esp_mul_fixed(&mat_b, shift);
 
     let mut result_software = AlignedDMat::<i16>::zeros(m, k);
-    let c_slice = result_software.as_mut_slice();
-    let a_slice = mat_a.as_slice();
-    let b_slice = mat_b.as_slice();
 
     for i in 0..m {
         for j in 0..k {
             let mut sum: i32 = 0;
             for s in 0..n {
-                // a_slice[s(col) * m(rows) + i(row)]
-                // b_slice[j(col) * n(rows) + s(row)]
-                sum += (a_slice[s * m + i] as i32) * (b_slice[j * n + s] as i32);
+                sum += (mat_a[(i, s)] as i32) * (mat_b[(s, j)] as i32);
             }
             let round_offset = if shift > 0 { 32767 >> shift } else { 0 };
-            // c_slice[j(col) * m(rows) + i(row)]
-            c_slice[j * m + i] = ((sum + round_offset) >> shift) as i16;
+            result_software[(i, j)] = ((sum + round_offset) >> shift) as i16;
         }
     }
 
     let mut success = true;
-    for i in 0..(m * k) {
-        let diff = (result_hardware[i] as i32 - result_software[i] as i32).abs();
-        if diff > 1 {
-            error!(
-                "MISMATCH FIXED at index {}: Hardware = {}, Software = {}",
-                i, result_hardware[i], result_software[i]
-            );
-            success = false;
+    for j in 0..k {
+        for i in 0..m {
+            let diff = (result_hardware[(i, j)] as i32 - result_software[(i, j)] as i32).abs();
+            if diff > 1 {
+                error!(
+                    "MISMATCH FIXED at (row: {}, col: {}): Hardware = {}, Software = {}",
+                    i,
+                    j,
+                    result_hardware[(i, j)],
+                    result_software[(i, j)]
+                );
+                success = false;
+            }
         }
     }
 
@@ -185,9 +197,12 @@ fn benchmark_matrix_math() {
     let mut mat_a = AlignedDMat::<f32>::zeros(size, size);
     let mut mat_b = AlignedDMat::<f32>::zeros(size, size);
 
-    for i in 0..(size * size) {
-        mat_a[i] = i as f32 % 7.0;
-        mat_b[i] = (size * size - i) as f32 % 11.0;
+    for c in 0..size {
+        for r in 0..size {
+            let i = c * size + r;
+            mat_a[(r, c)] = i as f32 % 7.0;
+            mat_b[(r, c)] = (size * size - i) as f32 % 11.0;
+        }
     }
 
     info!("Executing Hardware Accelerated Multiplication (Xtensa SIMD)...");
@@ -212,8 +227,10 @@ fn benchmark_matrix_math() {
     );
 
     let mut diff_accum = 0.0;
-    for i in 0..(size * size) {
-        diff_accum += (result_hw[i] - result_sw[i]).abs();
+    for c in 0..size {
+        for r in 0..size {
+            diff_accum += (result_hw[(r, c)] - result_sw[(r, c)]).abs();
+        }
     }
 
     info!(
@@ -240,14 +257,18 @@ fn benchmark_matrix_math_ex() {
     let mut mat_a = AlignedDMat::<f32>::zeros(a_stride, a_stride);
     let mut mat_b = AlignedDMat::<f32>::zeros(b_stride, b_stride);
 
-    let a_slice_mut = mat_a.as_mut_slice();
-    for i in 0..(a_stride * a_stride) {
-        a_slice_mut[i] = i as f32 % 7.0;
+    for c in 0..a_stride {
+        for r in 0..a_stride {
+            let i = c * a_stride + r;
+            mat_a[(r, c)] = i as f32 % 7.0;
+        }
     }
 
-    let b_slice_mut = mat_b.as_mut_slice();
-    for i in 0..(b_stride * b_stride) {
-        b_slice_mut[i] = (b_stride * b_stride - i) as f32 % 11.0;
+    for c in 0..b_stride {
+        for r in 0..b_stride {
+            let i = c * b_stride + r;
+            mat_b[(r, c)] = (b_stride * b_stride - i) as f32 % 11.0;
+        }
     }
 
     info!("Executing Hardware Accelerated Multiplication (Xtensa SIMD EX)...");
@@ -262,18 +283,15 @@ fn benchmark_matrix_math_ex() {
 
     info!("Executing ANSI Software Multiplication (Manual Nested Loops)...");
     let mut result_sw = AlignedDMat::<f32>::zeros(m, k);
-    let c_slice = result_sw.as_mut_slice();
-    let a_slice = mat_a.as_slice();
-    let b_slice = mat_b.as_slice();
 
     let start_sw = Instant::now();
     for i in 0..m {
         for j in 0..k {
             let mut sum = 0.0;
             for s in 0..n {
-                sum += a_slice[s * a_stride + i] * b_slice[j * b_stride + s];
+                sum += mat_a[(i, s)] * mat_b[(s, j)];
             }
-            c_slice[j * m + i] = sum;
+            result_sw[(i, j)] = sum;
         }
     }
     let duration_sw = start_sw.elapsed();
@@ -284,9 +302,10 @@ fn benchmark_matrix_math_ex() {
     );
 
     let mut diff_accum = 0.0;
-    let res_hw_slice = result_hw.as_slice();
-    for i in 0..(m * k) {
-        diff_accum += (res_hw_slice[i] - c_slice[i]).abs();
+    for j in 0..k {
+        for i in 0..m {
+            diff_accum += (result_hw[(i, j)] - result_sw[(i, j)]).abs();
+        }
     }
 
     info!(
@@ -312,9 +331,12 @@ fn benchmark_matrix_math_fixed() {
     let mut mat_a = AlignedDMat::<i16>::zeros(size, size);
     let mut mat_b = AlignedDMat::<i16>::zeros(size, size);
 
-    for i in 0..(size * size) {
-        mat_a[i] = (i as i16 * 17) % 2000;
-        mat_b[i] = (3000 - i as i16 * 13) % 2000;
+    for c in 0..size {
+        for r in 0..size {
+            let i = c * size + r;
+            mat_a[(r, c)] = (i as i16 * 17) % 2000;
+            mat_b[(r, c)] = (3000 - i as i16 * 13) % 2000;
+        }
     }
 
     info!("Executing Vector Accelerated Multiplication (Xtensa qacc)...");
@@ -329,9 +351,6 @@ fn benchmark_matrix_math_fixed() {
 
     info!("Executing ANSI Software Fixed-Point Multiplication...");
     let mut result_sw = AlignedDMat::<i16>::zeros(size, size);
-    let a_slice = mat_a.as_slice();
-    let b_slice = mat_b.as_slice();
-    let c_slice = result_sw.as_mut_slice();
 
     let start_sw = Instant::now();
     let round_offset = 32767 >> 15;
@@ -340,9 +359,9 @@ fn benchmark_matrix_math_fixed() {
         for j in 0..size {
             let mut sum: i32 = 0;
             for s in 0..size {
-                sum += (a_slice[s * size + i] as i32) * (b_slice[j * size + s] as i32);
+                sum += (mat_a[(i, s)] as i32) * (mat_b[(s, j)] as i32);
             }
-            c_slice[j * size + i] = ((sum + round_offset) >> 15) as i16;
+            result_sw[(i, j)] = ((sum + round_offset) >> 15) as i16;
         }
     }
     let duration_sw = start_sw.elapsed();
@@ -353,8 +372,10 @@ fn benchmark_matrix_math_fixed() {
     );
 
     let mut diff_accum: i32 = 0;
-    for i in 0..(size * size) {
-        diff_accum += (result_hw[i] as i32 - result_sw[i] as i32).abs();
+    for j in 0..size {
+        for i in 0..size {
+            diff_accum += (result_hw[(i, j)] as i32 - result_sw[(i, j)] as i32).abs();
+        }
     }
 
     info!(

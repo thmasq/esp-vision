@@ -99,9 +99,22 @@ pub unsafe fn dspm_mult_s16_aes3_core(
     }
 }
 
-/// Safely multiply two Q15 fixed-point matrices.
-pub fn esp_gemm_s16(a: &[i16], b: &[i16], c: &mut [i16], m: usize, n: usize, k: usize, shift: i32) {
-    assert!(
+/// Multiplies two Q15 fixed-point matrices using ESP32-S3 SIMD vector instructions.
+///
+/// # Safety
+/// The caller must ensure that:
+/// - `m` is a multiple of 8 (required for SIMD S16 unrolling).
+/// - Slices `a`, `b`, and `c` point to 16-byte aligned memory.
+pub unsafe fn esp_gemm_s16(
+    a: &[i16],
+    b: &[i16],
+    c: &mut [i16],
+    m: usize,
+    n: usize,
+    k: usize,
+    shift: i32,
+) {
+    debug_assert!(
         m % 8 == 0,
         "m must be a multiple of 8 for SIMD S16 column-major multiplication."
     );
@@ -110,27 +123,12 @@ pub fn esp_gemm_s16(a: &[i16], b: &[i16], c: &mut [i16], m: usize, n: usize, k: 
     let ptr_b = b.as_ptr();
     let ptr_c = c.as_mut_ptr();
 
-    if ptr_a as usize % 16 == 0 && ptr_b as usize % 16 == 0 && ptr_c as usize % 16 == 0 {
-        unsafe {
-            dspm_mult_s16_aes3_core(ptr_a, ptr_b, ptr_c, m, n, k, shift);
-        }
-    } else {
-        let round_val = if shift < 0 {
-            16383 >> -shift
-        } else {
-            32767 >> shift
-        };
-
-        for j in 0..k {
-            for i in 0..m {
-                let mut acc: i32 = round_val;
-                for s in 0..n {
-                    let a_val = a[s * m + i] as i32;
-                    let b_val = b[j * n + s] as i32;
-                    acc += a_val * b_val;
-                }
-                c[j * m + i] = (acc >> shift) as i16;
-            }
-        }
+    // Informs the LLVM optimizer that these pointers are strictly 16-byte aligned.
+    unsafe {
+        core::hint::assert_unchecked(ptr_a as usize % 16 == 0);
+        core::hint::assert_unchecked(ptr_b as usize % 16 == 0);
+        core::hint::assert_unchecked(ptr_c as usize % 16 == 0);
     }
+
+    unsafe { dspm_mult_s16_aes3_core(ptr_a, ptr_b, ptr_c, m, n, k, shift) };
 }
