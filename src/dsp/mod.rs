@@ -30,7 +30,7 @@ pub trait AlignedDVecExt<T> {
     fn from_slice(nrows: usize, slice: &[T]) -> Self;
 }
 
-/// Extension trait exposing hardware accelerated math routines (Floating Point).
+/// Extension trait exposing hardware accelerated matrix math routines (Floating Point).
 pub trait EspMatrixMath {
     /// Multiplies `self` by `rhs` utilizing ESP32-S3 hardware acceleration.
     /// Allocates and returns a new `AlignedDMat`.
@@ -71,6 +71,30 @@ pub trait EspMatrixMath {
 pub trait EspDotProd {
     /// Computes the dot product using ESP32-S3 PIE SIMD instructions.
     fn esp_dot(&self, other: &Self) -> f32;
+}
+
+/// Extension trait exposing hardware accelerated element-wise vector routines (Floating Point).
+pub trait EspVectorMath {
+    /// Element-wise addition using ESP32-S3 hardware acceleration.
+    /// Allocates and returns a new `AlignedDVec`.
+    fn esp_add(&self, rhs: &Self) -> Self;
+
+    /// Element-wise addition, writing directly to a pre-allocated `out` vector.
+    fn esp_add_to(&self, rhs: &Self, out: &mut Self);
+
+    /// Element-wise subtraction using ESP32-S3 hardware acceleration.
+    /// Allocates and returns a new `AlignedDVec`.
+    fn esp_sub(&self, rhs: &Self) -> Self;
+
+    /// Element-wise subtraction, writing directly to a pre-allocated `out` vector.
+    fn esp_sub_to(&self, rhs: &Self, out: &mut Self);
+
+    /// Element-wise multiplication using ESP32-S3 hardware acceleration.
+    /// Allocates and returns a new `AlignedDVec`.
+    fn esp_mul_elem(&self, rhs: &Self) -> Self;
+
+    /// Element-wise multiplication, writing directly to a pre-allocated `out` vector.
+    fn esp_mul_elem_to(&self, rhs: &Self, out: &mut Self);
 }
 
 /// Extension trait exposing hardware accelerated fixed-point math routines (Q-format).
@@ -161,7 +185,126 @@ impl<R: Dim> EspDotProd for Matrix<f32, R, U1, EspAlignedStorage<f32, R, U1>> {
     }
 }
 
-// Implement the accelerated operations exclusively for f32 matrices
+impl EspVectorMath for AlignedDVec<f32> {
+    fn esp_add(&self, rhs: &Self) -> Self {
+        let mut result = Self::zeros(self.nrows());
+        self.esp_add_to(rhs, &mut result);
+        result
+    }
+
+    fn esp_add_to(&self, rhs: &Self, out: &mut Self) {
+        assert_eq!(
+            self.nrows(),
+            rhs.nrows(),
+            "Vectors must have the same length"
+        );
+        assert_eq!(
+            self.nrows(),
+            out.nrows(),
+            "Output vector must have the same length"
+        );
+        assert_eq!(
+            self.data.physical_stride, rhs.data.physical_stride,
+            "Vectors must have the same padded physical stride"
+        );
+
+        unsafe {
+            let a_ptr = self.data.ptr();
+            let b_ptr = rhs.data.ptr();
+            let out_ptr = out.data.ptr_mut();
+
+            core::hint::assert_unchecked(a_ptr as usize % 16 == 0);
+            core::hint::assert_unchecked(b_ptr as usize % 16 == 0);
+            core::hint::assert_unchecked(out_ptr as usize % 16 == 0);
+
+            let padded_len = self.data.physical_stride;
+
+            crate::dsp::vector::dsps_add_f32::dsps_add_f32_aes3_core(
+                a_ptr, b_ptr, out_ptr, padded_len,
+            )
+        }
+    }
+
+    fn esp_sub(&self, rhs: &Self) -> Self {
+        let mut result = Self::zeros(self.nrows());
+        self.esp_sub_to(rhs, &mut result);
+        result
+    }
+
+    fn esp_sub_to(&self, rhs: &Self, out: &mut Self) {
+        assert_eq!(
+            self.nrows(),
+            rhs.nrows(),
+            "Vectors must have the same length"
+        );
+        assert_eq!(
+            self.nrows(),
+            out.nrows(),
+            "Output vector must have the same length"
+        );
+        assert_eq!(
+            self.data.physical_stride, rhs.data.physical_stride,
+            "Vectors must have the same padded physical stride"
+        );
+
+        unsafe {
+            let a_ptr = self.data.ptr();
+            let b_ptr = rhs.data.ptr();
+            let out_ptr = out.data.ptr_mut();
+
+            core::hint::assert_unchecked(a_ptr as usize % 16 == 0);
+            core::hint::assert_unchecked(b_ptr as usize % 16 == 0);
+            core::hint::assert_unchecked(out_ptr as usize % 16 == 0);
+
+            let padded_len = self.data.physical_stride;
+
+            crate::dsp::vector::dsps_sub_f32::dsps_sub_f32_aes3_core(
+                a_ptr, b_ptr, out_ptr, padded_len,
+            )
+        }
+    }
+
+    fn esp_mul_elem(&self, rhs: &Self) -> Self {
+        let mut result = Self::zeros(self.nrows());
+        self.esp_mul_elem_to(rhs, &mut result);
+        result
+    }
+
+    fn esp_mul_elem_to(&self, rhs: &Self, out: &mut Self) {
+        assert_eq!(
+            self.nrows(),
+            rhs.nrows(),
+            "Vectors must have the same length"
+        );
+        assert_eq!(
+            self.nrows(),
+            out.nrows(),
+            "Output vector must have the same length"
+        );
+        assert_eq!(
+            self.data.physical_stride, rhs.data.physical_stride,
+            "Vectors must have the same padded physical stride"
+        );
+
+        unsafe {
+            let a_ptr = self.data.ptr();
+            let b_ptr = rhs.data.ptr();
+            let out_ptr = out.data.ptr_mut();
+
+            core::hint::assert_unchecked(a_ptr as usize % 16 == 0);
+            core::hint::assert_unchecked(b_ptr as usize % 16 == 0);
+            core::hint::assert_unchecked(out_ptr as usize % 16 == 0);
+
+            let padded_len = self.data.physical_stride;
+
+            crate::dsp::vector::dsps_mul_f32::dsps_mul_f32_aes3_core(
+                a_ptr, b_ptr, out_ptr, padded_len,
+            )
+        }
+    }
+}
+
+// Implement the accelerated matrix operations exclusively for f32 matrices
 impl EspMatrixMath for AlignedDMat<f32> {
     fn esp_mul(&self, rhs: &Self) -> Self {
         let mut result = Self::zeros(self.nrows(), rhs.ncols());
@@ -272,7 +415,7 @@ impl EspMatrixMath for AlignedDMat<f32> {
     }
 }
 
-// Implement the accelerated vector operations exclusively for i16 matrices
+// Implement the accelerated matrix operations exclusively for i16 matrices
 impl EspFixedMatrixMath for AlignedDMat<i16> {
     fn esp_mul_fixed(&self, rhs: &Self, shift: i32) -> Self {
         let mut result = Self::zeros(self.nrows(), rhs.ncols());

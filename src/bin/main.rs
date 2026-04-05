@@ -15,7 +15,7 @@ use esp_hal::timer::timg::TimerGroup;
 
 use esp_vision::dsp::{
     AlignedDMat, AlignedDMatExt, AlignedDVec, AlignedDVecExt, EspDotProd, EspFixedMatrixMath,
-    EspMatrixMath,
+    EspMatrixMath, EspVectorMath,
 };
 use log::{error, info};
 
@@ -192,11 +192,11 @@ fn test_matrix_math_fixed() {
     }
 }
 
-fn test_vector_dotprod() {
-    info!("--- FUNCTIONAL TEST (VECTOR DOT PRODUCT) ---");
+fn test_vector_math() {
+    info!("--- FUNCTIONAL TEST (VECTOR MATH) ---");
 
     let size = 15;
-    info!("Initializing vector of size {}...", size);
+    info!("Initializing vectors of size {}...", size);
 
     let mut vec_a = AlignedDVec::<f32>::zeros(size);
     let mut vec_b = AlignedDVec::<f32>::zeros(size);
@@ -206,18 +206,65 @@ fn test_vector_dotprod() {
         vec_b[(i, 0)] = (size - i) as f32;
     }
 
-    let result_hardware = vec_a.esp_dot(&vec_b);
-    let result_software = vec_a.dot(&vec_b);
+    let mut success = true;
 
-    let diff = (result_hardware - result_software).abs();
+    // 1. Dot Product
+    let dot_hw = vec_a.esp_dot(&vec_b);
+    let dot_sw = vec_a.dot(&vec_b);
+    if (dot_hw - dot_sw).abs() > 0.0001 {
+        error!("DOT FAILED: HW = {}, SW = {}", dot_hw, dot_sw);
+        success = false;
+    }
 
-    if diff > 0.0001 {
-        error!(
-            "FAILED: MISMATCH Hardware = {}, Software = {}",
-            result_hardware, result_software
-        );
+    // 2. Addition
+    let add_hw = vec_a.esp_add(&vec_b);
+    for i in 0..size {
+        let sw_val = vec_a[(i, 0)] + vec_b[(i, 0)];
+        if (add_hw[(i, 0)] - sw_val).abs() > 0.0001 {
+            error!(
+                "ADD FAILED at {}: HW = {}, SW = {}",
+                i,
+                add_hw[(i, 0)],
+                sw_val
+            );
+            success = false;
+        }
+    }
+
+    // 3. Subtraction
+    let sub_hw = vec_a.esp_sub(&vec_b);
+    for i in 0..size {
+        let sw_val = vec_a[(i, 0)] - vec_b[(i, 0)];
+        if (sub_hw[(i, 0)] - sw_val).abs() > 0.0001 {
+            error!(
+                "SUB FAILED at {}: HW = {}, SW = {}",
+                i,
+                sub_hw[(i, 0)],
+                sw_val
+            );
+            success = false;
+        }
+    }
+
+    // 4. Multiplication
+    let mul_hw = vec_a.esp_mul_elem(&vec_b);
+    for i in 0..size {
+        let sw_val = vec_a[(i, 0)] * vec_b[(i, 0)];
+        if (mul_hw[(i, 0)] - sw_val).abs() > 0.0001 {
+            error!(
+                "MUL FAILED at {}: HW = {}, SW = {}",
+                i,
+                mul_hw[(i, 0)],
+                sw_val
+            );
+            success = false;
+        }
+    }
+
+    if success {
+        info!("SUCCESS: Assembly SIMD Vector math matches standard software math");
     } else {
-        info!("SUCCESS: Assembly SIMD dot product matches standard nalgebra dot");
+        error!("FAILED: One or more vector operations produced incorrect results.");
     }
 }
 
@@ -483,8 +530,8 @@ fn benchmark_matrix_math_small_hot_loops() {
     }
 }
 
-fn benchmark_vector_dotprod() {
-    info!("--- BENCHMARK TEST (VECTOR DOT PRODUCT) ---");
+fn benchmark_vector_math() {
+    info!("--- BENCHMARK TEST (VECTOR MATH) ---");
     let size = 1024;
     let iterations = 10000;
 
@@ -495,50 +542,104 @@ fn benchmark_vector_dotprod() {
 
     let mut vec_a = AlignedDVec::<f32>::zeros(size);
     let mut vec_b = AlignedDVec::<f32>::zeros(size);
+    let mut vec_out = AlignedDVec::<f32>::zeros(size);
 
     for i in 0..size {
         vec_a[(i, 0)] = i as f32 % 7.0;
         vec_b[(i, 0)] = (size - i) as f32 % 11.0;
     }
 
-    info!("Executing Hardware Accelerated Dot Product (Xtensa SIMD)...");
-    let start_hw = Instant::now();
-    let mut hw_res = 0.0;
+    // --- DOT PRODUCT ---
+    let start_hw_dot = Instant::now();
     for _ in 0..iterations {
-        hw_res = vec_a.esp_dot(&vec_b);
+        // Prevent the compiler from optimizing away the loop!
+        core::hint::black_box(vec_a.esp_dot(&vec_b));
     }
-    let duration_hw = start_hw.elapsed();
-    info!(
-        "-> Hardware Time: {} ms ({} microseconds)",
-        duration_hw.as_millis(),
-        duration_hw.as_micros()
-    );
+    let dur_hw_dot = start_hw_dot.elapsed();
 
-    info!("Executing ANSI Software Dot Product (nalgebra default)...");
-    let start_sw = Instant::now();
-    let mut sw_res = 0.0;
+    let start_sw_dot = Instant::now();
     for _ in 0..iterations {
-        sw_res = vec_a.dot(&vec_b);
+        // Prevent the compiler from optimizing away the loop!
+        core::hint::black_box(vec_a.dot(&vec_b));
     }
-    let duration_sw = start_sw.elapsed();
+    let dur_sw_dot = start_sw_dot.elapsed();
+
     info!(
-        "-> Software Time: {} ms ({} microseconds)",
-        duration_sw.as_millis(),
-        duration_sw.as_micros()
+        "Dot Product: HW {}us vs SW {}us ({:.2}x FASTER)",
+        dur_hw_dot.as_micros(),
+        dur_sw_dot.as_micros(),
+        dur_sw_dot.as_micros() as f32 / dur_hw_dot.as_micros() as f32
     );
 
-    let diff = (hw_res - sw_res).abs();
+    // --- ADDITION ---
+    let start_hw_add = Instant::now();
+    for _ in 0..iterations {
+        vec_a.esp_add_to(&vec_b, &mut vec_out);
+    }
+    let dur_hw_add = start_hw_add.elapsed();
+
+    let start_sw_add = Instant::now();
+    for _ in 0..iterations {
+        for i in 0..size {
+            vec_out[(i, 0)] = vec_a[(i, 0)] + vec_b[(i, 0)];
+        }
+        core::hint::black_box(&vec_out); // Just to be safe
+    }
+    let dur_sw_add = start_sw_add.elapsed();
+
     info!(
-        "Benchmark Result Consistency Check (Error magnitude): {}",
-        diff
+        "Addition:    HW {}us vs SW {}us ({:.2}x FASTER)",
+        dur_hw_add.as_micros(),
+        dur_sw_add.as_micros(),
+        dur_sw_add.as_micros() as f32 / dur_hw_add.as_micros() as f32
     );
 
-    let perf_gain = duration_sw.as_micros() as f32 / duration_hw.as_micros() as f32;
-    info!("===============================================");
+    // --- SUBTRACTION ---
+    let start_hw_sub = Instant::now();
+    for _ in 0..iterations {
+        vec_a.esp_sub_to(&vec_b, &mut vec_out);
+    }
+    let dur_hw_sub = start_hw_sub.elapsed();
+
+    let start_sw_sub = Instant::now();
+    for _ in 0..iterations {
+        for i in 0..size {
+            vec_out[(i, 0)] = vec_a[(i, 0)] - vec_b[(i, 0)];
+        }
+        core::hint::black_box(&vec_out);
+    }
+    let dur_sw_sub = start_sw_sub.elapsed();
+
     info!(
-        ">>> DOT PRODUCT PERFORMANCE GAIN: {:.2}x FASTER <<<",
-        perf_gain
+        "Subtraction: HW {}us vs SW {}us ({:.2}x FASTER)",
+        dur_hw_sub.as_micros(),
+        dur_sw_sub.as_micros(),
+        dur_sw_sub.as_micros() as f32 / dur_hw_sub.as_micros() as f32
     );
+
+    // --- MULTIPLICATION ---
+    let start_hw_mul = Instant::now();
+    for _ in 0..iterations {
+        vec_a.esp_mul_elem_to(&vec_b, &mut vec_out);
+    }
+    let dur_hw_mul = start_hw_mul.elapsed();
+
+    let start_sw_mul = Instant::now();
+    for _ in 0..iterations {
+        for i in 0..size {
+            vec_out[(i, 0)] = vec_a[(i, 0)] * vec_b[(i, 0)];
+        }
+        core::hint::black_box(&vec_out);
+    }
+    let dur_sw_mul = start_sw_mul.elapsed();
+
+    info!(
+        "Multiply:    HW {}us vs SW {}us ({:.2}x FASTER)",
+        dur_hw_mul.as_micros(),
+        dur_sw_mul.as_micros(),
+        dur_sw_mul.as_micros() as f32 / dur_hw_mul.as_micros() as f32
+    );
+
     info!("===============================================");
 }
 
@@ -563,13 +664,13 @@ async fn main(spawner: Spawner) -> ! {
     test_matrix_math();
     test_matrix_math_ex();
     test_matrix_math_fixed();
-    test_vector_dotprod();
+    test_vector_math();
 
     benchmark_matrix_math();
     benchmark_matrix_math_ex();
     benchmark_matrix_math_fixed();
     benchmark_matrix_math_small_hot_loops();
-    benchmark_vector_dotprod();
+    benchmark_vector_math();
 
     let _ = spawner;
 
