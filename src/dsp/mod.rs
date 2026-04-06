@@ -4,6 +4,7 @@ pub mod storage;
 pub mod vector;
 
 use alloc::AlignedVec;
+use nalgebra::ComplexField;
 use nalgebra::base::storage::{RawStorage, RawStorageMut};
 use nalgebra::{Dim, Dyn, Matrix, U1};
 use storage::EspAlignedStorage;
@@ -107,6 +108,12 @@ pub trait EspFixedMatrixMath {
     /// Multiplies `self` by `rhs` using ESP32-S3 vector instructions,
     /// writing directly to a pre-allocated `out` matrix.
     fn esp_mul_fixed_to(&self, rhs: &Self, shift: i32, out: &mut Self);
+}
+
+/// Extension trait for in-place Golub-Kahan Bidiagonalization SVD.
+pub trait EspBidiagonalization {
+    /// Bidiagonalizes the matrix in-place using ESP32-S3 SIMD acceleration.
+    fn esp_bidiagonalize(&mut self);
 }
 
 impl<T: nalgebra::Scalar + Copy + Default> AlignedDMatExt<T> for AlignedDMat<T> {
@@ -464,4 +471,137 @@ impl EspFixedMatrixMath for AlignedDMat<i16> {
             );
         }
     }
+}
+
+impl EspBidiagonalization for AlignedDMat<f32> {
+    fn esp_bidiagonalize(&mut self) {
+        let m = self.nrows();
+        let n = self.ncols();
+        let limit = m.min(n);
+
+        // Use the storage's physical stride for padded rows
+        let padded_m = self.data.physical_stride;
+        let padded_n = round_up(n, 4);
+        let a_stride = self.data.physical_stride;
+
+        let mut u = AlignedDVec::<f32>::zeros(m);
+        let mut v = AlignedDVec::<f32>::zeros(n);
+        let mut w = AlignedDVec::<f32>::zeros(n); // Temp vector for A^T * u
+        let mut z = AlignedDVec::<f32>::zeros(m); // Temp vector for A * v
+
+        for k in 0..limit {
+            // 1. ELIMINATE COLUMN (Apply Householder Left)
+            for i in 0..padded_m {
+                u[(i, 0)] = self[(i, k)];
+            }
+            let diag_val = householder_vec(&mut u, k, m);
+            self[(k, k)] = diag_val;
+
+            unsafe {
+                crate::dsp::matrix::dspm_bidiag_f32::dsps_gemv_t_f32_aes3(
+                    self.data.ptr(),
+                    u.data.ptr(),
+                    w.data.ptr_mut(),
+                    padded_m,
+                    padded_n,
+                    a_stride,
+                );
+            }
+
+            // Mask out the vectors affecting already solved columns
+            for j in 0..=k {
+                w[(j, 0)] = 0.0;
+            }
+
+            unsafe {
+                crate::dsp::matrix::dspm_bidiag_f32::dsps_ger_f32_aes3(
+                    self.data.ptr_mut(),
+                    u.data.ptr(),
+                    w.data.ptr(),
+                    2.0,
+                    padded_m,
+                    padded_n,
+                    a_stride,
+                );
+            }
+            // Zero out values below the diagonal for cleanliness
+            for i in (k + 1)..m {
+                self[(i, k)] = 0.0;
+            }
+
+            // 2. ELIMINATE ROW (Apply Householder Right)
+            if k < n - 2 {
+                for j in 0..padded_n {
+                    v[(j, 0)] = self[(k, j)];
+                }
+
+                let superdiag_val = householder_vec(&mut v, k + 1, n);
+
+                unsafe {
+                    crate::dsp::matrix::dspm_bidiag_f32::dsps_gemv_f32_aes3(
+                        self.data.ptr(),
+                        v.data.ptr(),
+                        z.data.ptr_mut(),
+                        padded_m,
+                        padded_n,
+                        a_stride,
+                    );
+                }
+
+                // Mask out the vectors affecting already solved rows
+                for i in 0..=k {
+                    z[(i, 0)] = 0.0;
+                }
+
+                unsafe {
+                    crate::dsp::matrix::dspm_bidiag_f32::dsps_ger_f32_aes3(
+                        self.data.ptr_mut(),
+                        z.data.ptr(),
+                        v.data.ptr(),
+                        2.0,
+                        padded_m,
+                        padded_n,
+                        a_stride,
+                    );
+                }
+
+                self[(k, k + 1)] = superdiag_val;
+                for j in (k + 2)..n {
+                    self[(k, j)] = 0.0;
+                }
+            }
+        }
+    }
+}
+
+/// Helper to generate the Householder reflection vector and return the scalar root.
+fn householder_vec(x: &mut AlignedDVec<f32>, start: usize, end: usize) -> f32 {
+    let mut norm_sq = 0.0;
+    for i in (start + 1)..end {
+        norm_sq += x[(i, 0)] * x[(i, 0)];
+    }
+
+    let x_start = x[(start, 0)];
+    let mut alpha = (x_start * x_start + norm_sq).sqrt();
+    if x_start > 0.0 {
+        alpha = -alpha;
+    }
+
+    let r = (0.5 * (alpha * alpha - x_start * alpha)).sqrt();
+    x[(start, 0)] -= alpha;
+
+    let inv_2r = 1.0 / (2.0 * r);
+    for i in start..end {
+        x[(i, 0)] *= inv_2r;
+    }
+
+    // Crucial: Mask out bounds to keep 16-byte SIMD alignments clean
+    for i in 0..start {
+        x[(i, 0)] = 0.0;
+    }
+    for i in end..x.nrows() {
+        x[(i, 0)] = 0.0;
+    }
+
+    alpha
 }
