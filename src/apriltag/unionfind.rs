@@ -1,5 +1,4 @@
 extern crate alloc;
-use crate::apriltag::image::Image;
 use alloc::vec::Vec;
 
 /// Represents a horizontal run of identical pixels.
@@ -21,39 +20,101 @@ pub struct Blob {
 
 pub struct RleUnionFind {
     pub segments: Vec<Segment>,
+    prev_row_start: usize,
+    prev_row_end: usize,
+    curr_row_start: usize,
+    current_y: u16,
 }
 
 impl RleUnionFind {
     pub fn new(capacity: usize) -> Self {
         Self {
-            // By allocating capacity upfront, a custom allocator can be used here
             segments: Vec::with_capacity(capacity),
+            prev_row_start: 0,
+            prev_row_end: 0,
+            curr_row_start: 0,
+            current_y: 0,
         }
     }
 
-    /// Step 1: Scan the binarized image and extract horizontal segments.
-    pub fn extract_segments(&mut self, image: &Image) {
+    /// Resets the global state before processing a new camera frame.
+    pub fn clear(&mut self) {
         self.segments.clear();
+        self.prev_row_start = 0;
+        self.prev_row_end = 0;
+        self.curr_row_start = 0;
+        self.current_y = 0;
+    }
 
-        for y in 0..image.height {
-            let row = image.row(y);
+    /// Processes a single DMA chunk of a thresholded monochrome image.
+    /// `chunk`: Flat slice of the binary image pixels.
+    /// `width`: Image width (e.g., 640).
+    /// `height`: Number of rows in this specific chunk.
+    /// `y_offset`: The global y-coordinate of the first row in this chunk.
+    pub fn process_chunk(&mut self, chunk: &[u8], width: usize, height: usize, y_offset: usize) {
+        let start_idx = self.segments.len();
+
+        // Step 1: Extract segments for this chunk
+        for local_y in 0..height {
+            let y = (y_offset + local_y) as u16;
+            let row_start = local_y * width;
+            let row = &chunk[row_start..row_start + width];
+
             let mut in_segment = false;
             let mut x_start = 0;
 
-            for x in 0..image.width {
+            for x in 0..width {
                 let is_active = row[x] == 255;
 
                 if is_active && !in_segment {
                     x_start = x as u16;
                     in_segment = true;
                 } else if !is_active && in_segment {
-                    self.push_segment(x_start, (x - 1) as u16, y as u16);
+                    self.push_segment(x_start, (x - 1) as u16, y);
                     in_segment = false;
                 }
             }
 
             if in_segment {
-                self.push_segment(x_start, (image.width - 1) as u16, y as u16);
+                self.push_segment(x_start, (width - 1) as u16, y);
+            }
+        }
+
+        // Step 2: Connect the newly added segments, carrying over state from previous chunks
+        for i in start_idx..self.segments.len() {
+            let curr_seg = self.segments[i];
+
+            if curr_seg.y > self.current_y {
+                self.prev_row_start = self.curr_row_start;
+                self.prev_row_end = i;
+                self.curr_row_start = i;
+                self.current_y = curr_seg.y;
+            }
+
+            if curr_seg.y == 0 {
+                continue;
+            }
+
+            if self.prev_row_start < self.prev_row_end
+                && self.segments[self.prev_row_start].y == curr_seg.y - 1
+            {
+                while self.prev_row_start < self.prev_row_end
+                    && self.segments[self.prev_row_start].x_end + 1 < curr_seg.x_start
+                {
+                    self.prev_row_start += 1;
+                }
+
+                let mut j = self.prev_row_start;
+                while j < self.prev_row_end {
+                    let prev_seg = self.segments[j];
+
+                    if prev_seg.x_start > curr_seg.x_end + 1 {
+                        break;
+                    }
+
+                    self.union(i as u32, j as u32);
+                    j += 1;
+                }
             }
         }
     }
@@ -105,55 +166,8 @@ impl RleUnionFind {
         }
     }
 
-    /// Step 2: Single-pass Sweepline to connect adjacent segments.
-    pub fn connect_components(&mut self) {
-        if self.segments.is_empty() {
-            return;
-        }
-
-        let mut prev_row_start = 0;
-        let mut prev_row_end = 0;
-        let mut curr_row_start = 0;
-        let mut current_y = self.segments[0].y;
-
-        for i in 0..self.segments.len() {
-            let curr_seg = self.segments[i];
-
-            if curr_seg.y > current_y {
-                prev_row_start = curr_row_start;
-                prev_row_end = i;
-                curr_row_start = i;
-                current_y = curr_seg.y;
-            }
-
-            if curr_seg.y == 0 {
-                continue;
-            }
-
-            if prev_row_start < prev_row_end && self.segments[prev_row_start].y == curr_seg.y - 1 {
-                while prev_row_start < prev_row_end
-                    && self.segments[prev_row_start].x_end + 1 < curr_seg.x_start
-                {
-                    prev_row_start += 1;
-                }
-
-                let mut j = prev_row_start;
-                while j < prev_row_end {
-                    let prev_seg = self.segments[j];
-
-                    if prev_seg.x_start > curr_seg.x_end + 1 {
-                        break;
-                    }
-
-                    self.union(i as u32, j as u32);
-                    j += 1;
-                }
-            }
-        }
-    }
-
     /// Step 3: Flatten the tree so every segment points directly to its blob root.
-    /// Call this once after `connect_components` is finished.
+    /// Call this ONCE after all chunks have been processed.
     pub fn flatten(&mut self) -> usize {
         let mut unique_blobs = 0;
         for i in 0..self.segments.len() {
