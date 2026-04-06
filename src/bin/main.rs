@@ -15,7 +15,7 @@ use esp_hal::timer::timg::TimerGroup;
 
 use esp_vision::dsp::{
     AlignedDMat, AlignedDMatExt, AlignedDVec, AlignedDVecExt, EspDotProd, EspFixedMatrixMath,
-    EspMatrixMath, EspVectorMath,
+    EspImageMath, EspMatrixMath, EspVectorMath,
 };
 use log::{error, info};
 
@@ -643,6 +643,128 @@ fn benchmark_vector_math() {
     info!("===============================================");
 }
 
+fn test_image_math() {
+    info!("--- FUNCTIONAL TEST (IMAGE MATH SIMD) ---");
+    let size = 64; // A multiple of 16 to test clean SIMD lanes
+
+    // Allocate raw vecs and slice them to guarantee 16-byte alignment
+    let mut raw_a = alloc::vec![0u8; size + 16];
+    let offset_a = raw_a.as_ptr().align_offset(16);
+    let slice_a = &mut raw_a[offset_a..offset_a + size];
+
+    let mut raw_b = alloc::vec![0u8; size + 16];
+    let offset_b = raw_b.as_ptr().align_offset(16);
+    let slice_b = &mut raw_b[offset_b..offset_b + size];
+
+    for i in 0..size {
+        slice_a[i] = (i * 3) as u8;
+        slice_b[i] = (255 - i) as u8;
+    }
+
+    let mut success = true;
+
+    // 1. Min/Max Test
+    let (min_hw, max_hw) = slice_a.esp_min_max();
+    let min_sw = *slice_a.iter().min().unwrap();
+    let max_sw = *slice_a.iter().max().unwrap();
+
+    if min_hw != min_sw || max_hw != max_sw {
+        error!(
+            "MIN/MAX FAILED: HW=({}, {}), SW=({}, {})",
+            min_hw, max_hw, min_sw, max_sw
+        );
+        success = false;
+    }
+
+    // 2. Sum Test
+    let sum_hw = slice_a.esp_sum();
+    // Use an iterator mapping to u32 so the software implementation doesn't overflow
+    let sum_sw: u32 = slice_a.iter().map(|&x| x as u32).sum();
+
+    if sum_hw != sum_sw {
+        error!("SUM FAILED: HW={}, SW={}", sum_hw, sum_sw);
+        success = false;
+    }
+
+    if success {
+        info!("SUCCESS: Assembly SIMD Image math matches standard software math");
+    } else {
+        error!("FAILED: Image math SIMD operations produced incorrect results.");
+    }
+}
+
+fn benchmark_image_math() {
+    info!("--- BENCHMARK TEST (IMAGE MATH SIMD) ---");
+    // Simulate a standard QQVGA image buffer size (160x120 = 19,200 pixels)
+    let size = 19_200;
+    let iterations = 1000;
+
+    info!(
+        "Allocating {} byte image buffers for benchmarking over {} iterations...",
+        size, iterations
+    );
+
+    // Guaranteed 16-byte aligned buffers
+    let mut raw_a = alloc::vec![0u8; size + 16];
+    let offset_a = raw_a.as_ptr().align_offset(16);
+    let slice_a = &mut raw_a[offset_a..offset_a + size];
+
+    let mut raw_b = alloc::vec![0u8; size + 16];
+    let offset_b = raw_b.as_ptr().align_offset(16);
+    let slice_b = &mut raw_b[offset_b..offset_b + size];
+
+    // Pre-fill with arbitrary data
+    for i in 0..size {
+        slice_a[i] = (i % 256) as u8;
+        slice_b[i] = ((size - i) % 256) as u8;
+    }
+
+    // --- MIN / MAX BENCHMARK ---
+    let start_hw_minmax = Instant::now();
+    for _ in 0..iterations {
+        core::hint::black_box(slice_a.esp_min_max());
+    }
+    let dur_hw_minmax = start_hw_minmax.elapsed();
+
+    let start_sw_minmax = Instant::now();
+    for _ in 0..iterations {
+        let min = *slice_a.iter().min().unwrap();
+        let max = *slice_a.iter().max().unwrap();
+        core::hint::black_box((min, max));
+    }
+    let dur_sw_minmax = start_sw_minmax.elapsed();
+
+    info!(
+        "Min/Max: HW {}us vs SW {}us ({:.2}x FASTER)",
+        dur_hw_minmax.as_micros(),
+        dur_sw_minmax.as_micros(),
+        dur_sw_minmax.as_micros() as f32 / dur_hw_minmax.as_micros() as f32
+    );
+
+    // --- SUM BENCHMARK ---
+    let start_hw_sum = Instant::now();
+    for _ in 0..iterations {
+        core::hint::black_box(slice_a.esp_sum());
+    }
+    let dur_hw_sum = start_hw_sum.elapsed();
+
+    let start_sw_sum = Instant::now();
+    for _ in 0..iterations {
+        let sum: u32 = slice_a.iter().map(|&x| x as u32).sum();
+        core::hint::black_box(sum);
+    }
+    let dur_sw_sum = start_sw_sum.elapsed();
+
+    info!(
+        "Sum:     HW {}us vs SW {}us ({:.2}x FASTER)",
+        dur_hw_sum.as_micros(),
+        dur_sw_sum.as_micros(),
+        dur_sw_sum.as_micros() as f32 / dur_hw_sum.as_micros() as f32
+    );
+
+    info!("===============================================");
+}
+
 #[allow(
     clippy::large_stack_frames,
     reason = "it's not unusual to allocate larger buffers etc. in main"
@@ -665,12 +787,14 @@ async fn main(spawner: Spawner) -> ! {
     test_matrix_math_ex();
     test_matrix_math_fixed();
     test_vector_math();
+    test_image_math();
 
     benchmark_matrix_math();
     benchmark_matrix_math_ex();
     benchmark_matrix_math_fixed();
     benchmark_matrix_math_small_hot_loops();
     benchmark_vector_math();
+    benchmark_image_math();
 
     let _ = spawner;
 

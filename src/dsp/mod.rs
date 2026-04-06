@@ -1,4 +1,5 @@
 pub mod alloc;
+pub mod image;
 pub mod matrix;
 pub mod storage;
 pub mod vector;
@@ -114,6 +115,15 @@ pub trait EspFixedMatrixMath {
 pub trait EspBidiagonalization {
     /// Bidiagonalizes the matrix in-place using ESP32-S3 SIMD acceleration.
     fn esp_bidiagonalize(&mut self);
+}
+
+/// Extension trait exposing hardware accelerated image processing routines.
+pub trait EspImageMath {
+    /// Finds the global minimum and maximum pixel values in the array using ESP32-S3 SIMD.
+    fn esp_min_max(&self) -> (u8, u8);
+
+    /// Accumulates the array of pixels into a single sum using the ESP32-S3 40-bit PIE accumulator.
+    fn esp_sum(&self) -> u32;
 }
 
 impl<T: nalgebra::Scalar + Copy + Default> AlignedDMatExt<T> for AlignedDMat<T> {
@@ -604,4 +614,16 @@ fn householder_vec(x: &mut AlignedDVec<f32>, start: usize, end: usize) -> f32 {
     }
 
     alpha
+}
+
+impl EspImageMath for [u8] {
+    #[inline(always)]
+    fn esp_min_max(&self) -> (u8, u8) {
+        crate::dsp::image::dspi_min_max_u8::dspi_min_max_u8(self)
+    }
+
+    #[inline(always)]
+    fn esp_sum(&self) -> u32 {
+        unsafe { crate::dsp::image::dspi_sum_u8::dspi_sum_u8(self) }
+    }
 }
