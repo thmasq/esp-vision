@@ -23,14 +23,28 @@ use esp_hal::{
     timer::timg::TimerGroup,
 };
 
+use embassy_time::Delay;
 use esp_vision::apriltag::decode::AprilTagDetection;
 use esp_vision::apriltag::unionfind::RleUnionFind;
-use esp_vision::ov2640::{Ov2640, Resolution};
+use esp_vision::ov2640::{FrameSize, Ov2640, PixelFormat};
 use log::info;
 
 extern crate alloc;
 
 esp_bootloader_esp_idf::esp_app_desc!();
+
+macro_rules! dma_alloc_buffer {
+    ($size:expr, $align:expr) => {{
+        let layout = core::alloc::Layout::from_size_align($size, $align).unwrap();
+        unsafe {
+            let ptr = alloc::alloc::alloc(layout);
+            if ptr.is_null() {
+                panic!("dma_alloc_buffer: alloc failed");
+            }
+            core::slice::from_raw_parts_mut(ptr, $size)
+        }
+    }};
+}
 
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy)]
@@ -83,20 +97,13 @@ async fn main(_spawner: Spawner) -> ! {
     let peripherals = esp_hal::init(config);
 
     esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 73744);
-
-    unsafe {
-        esp_alloc::HEAP.add_region(esp_alloc::HeapRegion::new(
-            0x3c00_0000 as *mut u8,
-            8 * 1024 * 1024,
-            esp_alloc::MemoryCapability::External.into(),
-        ));
-    }
+    esp_alloc::psram_allocator!(peripherals.PSRAM, esp_hal::psram);
 
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     esp_rtos::start(timg0.timer0);
 
     let lcd_cam = LcdCam::new(peripherals.LCD_CAM);
-    let cam_config = CamConfig::default().with_frequency(Rate::from_mhz(20));
+    let cam_config = CamConfig::default().with_frequency(Rate::from_mhz(24));
 
     let mut camera = Camera::new(lcd_cam.cam, peripherals.DMA_CH0, cam_config)
         .unwrap()
@@ -120,15 +127,27 @@ async fn main(_spawner: Spawner) -> ! {
         .into_async();
 
     let mut camera_sensor = Ov2640::new(i2c);
+    let mut delay = Delay;
+
     info!("Initializing OV2640...");
+
     camera_sensor
-        .init_yuv422()
+        .init(&mut delay)
         .await
-        .expect("Failed to init OV2640");
+        .expect("Failed to initialize base sensor registers");
+
     camera_sensor
-        .set_resolution(Resolution::Res640x480)
+        .set_pixel_format(PixelFormat::Yuv422, &mut delay)
         .await
-        .expect("Failed to set resolution");
+        .expect("Failed to set YUV422 format");
+
+    camera_sensor
+        .set_frame_size(FrameSize::Vga, &mut delay)
+        .await
+        .expect("Failed to set VGA resolution");
+
+    info!("Waiting for camera to stabilize...");
+    embassy_time::Timer::after_millis(500).await;
 
     let spi_dma_channel = peripherals.DMA_CH2;
     let mut spi_slave = Spi::new(peripherals.SPI2, SpiMode::_0)
@@ -174,13 +193,17 @@ async fn main(_spawner: Spawner) -> ! {
 
         let mut mono_image = esp_vision::apriltag::image::Image::new(640, 480, 640);
 
-        let (rx_descriptors, _) = esp_hal::dma_descriptors!(614400, 0);
+        let (rx_descriptors, _) = esp_hal::dma_descriptors_chunk_size!(614400, 0, 4032);
 
-        let camera_yuyv_psram: &'static mut [u8] = alloc::vec![0u8; 614_400].leak();
-
+        let camera_yuyv_psram = dma_alloc_buffer!(614_400, 64);
         let camera_yuyv_ptr = camera_yuyv_psram.as_ptr();
 
-        let mut dma_rx_buf = DmaRxBuf::new(rx_descriptors, camera_yuyv_psram).unwrap();
+        let mut dma_rx_buf = DmaRxBuf::new_with_config(
+            rx_descriptors,
+            camera_yuyv_psram,
+            esp_hal::dma::ExternalBurstConfig::Size64,
+        )
+        .unwrap();
 
         let sram_chunk_slice = unsafe {
             core::slice::from_raw_parts_mut(
@@ -300,6 +323,7 @@ async fn main(_spawner: Spawner) -> ! {
         }
     };
 
-    embassy_futures::join::join(spi_slave_future, vision_pipeline_future).await;
+    // embassy_futures::join::join(spi_slave_future, vision_pipeline_future).await;
+    vision_pipeline_future.await;
     unreachable!();
 }
