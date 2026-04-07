@@ -193,7 +193,7 @@ async fn main(_spawner: Spawner) -> ! {
 
         let mut mono_image = esp_vision::apriltag::image::Image::new(640, 480, 640);
 
-        let (rx_descriptors, _) = esp_hal::dma_descriptors_chunk_size!(614400, 0, 4032);
+        let (rx_descriptors, _) = esp_hal::dma_descriptors_chunk_size!(614400, 0, 3840);
 
         let camera_yuyv_psram = dma_alloc_buffer!(614_400, 64);
         let camera_yuyv_ptr = camera_yuyv_psram.as_ptr();
