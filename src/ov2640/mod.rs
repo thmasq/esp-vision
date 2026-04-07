@@ -151,7 +151,7 @@ where
 
         let mut clk_div = 7;
         let mut pclk_div = 8;
-        let mut clk_2x = 0;
+        let mut clk_2x = 1;
         let mut pclk_auto = 1;
 
         if self.pixel_format == PixelFormat::Jpeg {
@@ -188,11 +188,10 @@ where
         self.write_reg(Bank::Dsp, 0xD3, pclk).await?; // R_DVP_SP
         self.write_reg(Bank::Dsp, 0x05, 0x00).await?; // R_BYPASS_DSP_EN
 
-        delay.delay_ms(10).await;
-
         let format_copy = self.pixel_format;
         self.set_pixel_format(format_copy, delay).await?;
 
+        delay.delay_ms(10).await;
         Ok(())
     }
 
