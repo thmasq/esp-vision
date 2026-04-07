@@ -8,798 +8,298 @@
 #![deny(clippy::large_stack_frames)]
 
 use embassy_executor::Spawner;
-use embassy_time::{Duration, Instant, Timer};
+use embassy_time::Instant;
 use esp_backtrace as _;
-use esp_hal::clock::CpuClock;
-use esp_hal::timer::timg::TimerGroup;
-
-use esp_vision::dsp::{
-    AlignedDMat, AlignedDMatExt, AlignedDVec, AlignedDVecExt, EspDotProd, EspFixedMatrixMath,
-    EspImageMath, EspMatrixMath, EspVectorMath,
+use esp_hal::{
+    clock::CpuClock,
+    dma::{DmaRxBuf, DmaTxBuf},
+    i2c::master::{Config as I2cConfig, I2c},
+    lcd_cam::{
+        LcdCam,
+        cam::{Camera, Config as CamConfig},
+    },
+    spi::{Mode as SpiMode, slave::Spi},
+    time::Rate,
+    timer::timg::TimerGroup,
 };
-use log::{error, info};
+
+use esp_vision::apriltag::decode::AprilTagDetection;
+use esp_vision::apriltag::unionfind::RleUnionFind;
+use esp_vision::ov2640::{Ov2640, Resolution};
+use log::info;
 
 extern crate alloc;
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
-fn test_matrix_math() {
-    info!("--- FUNCTIONAL TEST (FLOAT) ---");
-    info!("Initializing 4x4 test matrices...");
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy)]
+pub struct SpiPayload {
+    pub sequence: u32,
+    pub timestamp_ms: u64,
+    pub tag_count: u8,
+    pub tags: [AprilTagDetection; 10],
+}
 
-    let mut mat_a = AlignedDMat::<f32>::zeros(4, 4);
-    let mut mat_b = AlignedDMat::<f32>::zeros(4, 4);
-
-    for c in 0..4 {
-        for r in 0..4 {
-            let i = c * 4 + r;
-            mat_a[(r, c)] = (i + 1) as f32;
-            mat_b[(r, c)] = (16 - i) as f32;
+impl SpiPayload {
+    pub const fn empty() -> Self {
+        Self {
+            sequence: 0,
+            timestamp_ms: 0,
+            tag_count: 0,
+            tags: [AprilTagDetection {
+                id: 0,
+                hamming: 0,
+                rotation: 0,
+                confidence: 0.0,
+                center_x: 0.0,
+                center_y: 0.0,
+                yaw: 0.0,
+                pitch: 0.0,
+                roll: 0.0,
+                distance_mm: 0.0,
+            }; 10],
         }
-    }
-
-    let result_hardware = mat_a.esp_mul(&mat_b);
-
-    let mut result_software = AlignedDMat::<f32>::zeros(4, 4);
-    result_software.gemm(1.0, &mat_a, &mat_b, 0.0);
-
-    let mut success = true;
-    for c in 0..4 {
-        for r in 0..4 {
-            let diff = (result_hardware[(r, c)] - result_software[(r, c)]).abs();
-            if diff > 0.0001 {
-                error!(
-                    "MISMATCH at (row: {}, col: {}): Hardware = {}, Software = {}",
-                    r,
-                    c,
-                    result_hardware[(r, c)],
-                    result_software[(r, c)]
-                );
-                success = false;
-            }
-        }
-    }
-
-    if success {
-        info!("SUCCESS: Assembly SIMD matches standard nalgebra math");
-    } else {
-        error!("FAILED: Assembly logic has a math or memory alignment error.");
     }
 }
 
-fn test_matrix_math_ex() {
-    info!("--- FUNCTIONAL TEST (EXTENDED STRIDES) ---");
-    info!("Extracting 4x4 sub-matrices from 8x8 parents...");
-
-    let a_stride = 8;
-    let b_stride = 8;
-    let m = 4;
-    let n = 4;
-    let k = 4;
-
-    let mut mat_a = AlignedDMat::<f32>::zeros(8, 8);
-    let mut mat_b = AlignedDMat::<f32>::zeros(8, 8);
-
-    for c in 0..8 {
-        for r in 0..8 {
-            let i = c * 8 + r;
-            mat_a[(r, c)] = (i + 1) as f32;
-            mat_b[(r, c)] = (64 - i) as f32;
-        }
-    }
-
-    let result_hardware = mat_a.esp_mul_ex(a_stride, &mat_b, b_stride, m, n, k);
-
-    let mut result_software = AlignedDMat::<f32>::zeros(m, k);
-
-    // Manual math leveraging standard (row, col) indexing
-    for i in 0..m {
-        for j in 0..k {
-            let mut sum = 0.0;
-            for s in 0..n {
-                sum += mat_a[(i, s)] * mat_b[(s, j)];
-            }
-            result_software[(i, j)] = sum;
-        }
-    }
-
-    let mut success = true;
-    for j in 0..k {
-        for i in 0..m {
-            let diff = (result_hardware[(i, j)] - result_software[(i, j)]).abs();
-            if diff > 0.0001 {
-                error!(
-                    "MISMATCH EX at (row: {}, col: {}): Hardware = {}, Software = {}",
-                    i,
-                    j,
-                    result_hardware[(i, j)],
-                    result_software[(i, j)]
-                );
-                success = false;
-            }
-        }
-    }
-
-    if success {
-        info!("SUCCESS: Assembly SIMD EX matches row-major baseline");
-    } else {
-        error!("FAILED: Assembly logic EX has a math or memory alignment error.");
-    }
-}
-
-fn test_matrix_math_fixed() {
-    info!("--- FUNCTIONAL TEST (Q15 FIXED-POINT) ---");
-    info!("Initializing 8x8 fixed-point test matrices...");
-
-    let m = 8;
-    let n = 8;
-    let k = 8;
-
-    let mut mat_a = AlignedDMat::<i16>::zeros(m, n);
-    let mut mat_b = AlignedDMat::<i16>::zeros(n, k);
-
-    for c in 0..n {
-        for r in 0..m {
-            let i = c * m + r;
-            mat_a[(r, c)] = (i as i16 * 10) % 1000;
-        }
-    }
-
-    for c in 0..k {
-        for r in 0..n {
-            let i = c * n + r;
-            mat_b[(r, c)] = (2000 - i as i16 * 5) % 1000;
-        }
-    }
-
-    let shift = 15;
-    let result_hardware = mat_a.esp_mul_fixed(&mat_b, shift);
-
-    let mut result_software = AlignedDMat::<i16>::zeros(m, k);
-
-    for i in 0..m {
-        for j in 0..k {
-            let mut sum: i32 = 0;
-            for s in 0..n {
-                sum += (mat_a[(i, s)] as i32) * (mat_b[(s, j)] as i32);
-            }
-            let round_offset = if shift > 0 { 32767 >> shift } else { 0 };
-            result_software[(i, j)] = ((sum + round_offset) >> shift) as i16;
-        }
-    }
-
-    let mut success = true;
-    for j in 0..k {
-        for i in 0..m {
-            let diff = (result_hardware[(i, j)] as i32 - result_software[(i, j)] as i32).abs();
-            if diff > 1 {
-                error!(
-                    "MISMATCH FIXED at (row: {}, col: {}): Hardware = {}, Software = {}",
-                    i,
-                    j,
-                    result_hardware[(i, j)],
-                    result_software[(i, j)]
-                );
-                success = false;
-            }
-        }
-    }
-
-    if success {
-        info!("SUCCESS: Assembly Vector Math matches fixed-point baseline");
-    } else {
-        error!("FAILED: Fixed-point assembly logic has an error.");
-    }
-}
-
-fn test_vector_math() {
-    info!("--- FUNCTIONAL TEST (VECTOR MATH) ---");
-
-    let size = 15;
-    info!("Initializing vectors of size {}...", size);
-
-    let mut vec_a = AlignedDVec::<f32>::zeros(size);
-    let mut vec_b = AlignedDVec::<f32>::zeros(size);
-
-    for i in 0..size {
-        vec_a[(i, 0)] = (i + 1) as f32;
-        vec_b[(i, 0)] = (size - i) as f32;
-    }
-
-    let mut success = true;
-
-    // 1. Dot Product
-    let dot_hw = vec_a.esp_dot(&vec_b);
-    let dot_sw = vec_a.dot(&vec_b);
-    if (dot_hw - dot_sw).abs() > 0.0001 {
-        error!("DOT FAILED: HW = {}, SW = {}", dot_hw, dot_sw);
-        success = false;
-    }
-
-    // 2. Addition
-    let add_hw = vec_a.esp_add(&vec_b);
-    for i in 0..size {
-        let sw_val = vec_a[(i, 0)] + vec_b[(i, 0)];
-        if (add_hw[(i, 0)] - sw_val).abs() > 0.0001 {
-            error!(
-                "ADD FAILED at {}: HW = {}, SW = {}",
-                i,
-                add_hw[(i, 0)],
-                sw_val
-            );
-            success = false;
-        }
-    }
-
-    // 3. Subtraction
-    let sub_hw = vec_a.esp_sub(&vec_b);
-    for i in 0..size {
-        let sw_val = vec_a[(i, 0)] - vec_b[(i, 0)];
-        if (sub_hw[(i, 0)] - sw_val).abs() > 0.0001 {
-            error!(
-                "SUB FAILED at {}: HW = {}, SW = {}",
-                i,
-                sub_hw[(i, 0)],
-                sw_val
-            );
-            success = false;
-        }
-    }
-
-    // 4. Multiplication
-    let mul_hw = vec_a.esp_mul_elem(&vec_b);
-    for i in 0..size {
-        let sw_val = vec_a[(i, 0)] * vec_b[(i, 0)];
-        if (mul_hw[(i, 0)] - sw_val).abs() > 0.0001 {
-            error!(
-                "MUL FAILED at {}: HW = {}, SW = {}",
-                i,
-                mul_hw[(i, 0)],
-                sw_val
-            );
-            success = false;
-        }
-    }
-
-    if success {
-        info!("SUCCESS: Assembly SIMD Vector math matches standard software math");
-    } else {
-        error!("FAILED: One or more vector operations produced incorrect results.");
-    }
-}
-
-fn benchmark_matrix_math() {
-    info!("--- BENCHMARK TEST (FLOAT) ---");
-    let size = 64;
-
-    info!("Allocating {}x{} matrices for benchmarking...", size, size);
-
-    let mut mat_a = AlignedDMat::<f32>::zeros(size, size);
-    let mut mat_b = AlignedDMat::<f32>::zeros(size, size);
-
-    for c in 0..size {
-        for r in 0..size {
-            let i = c * size + r;
-            mat_a[(r, c)] = i as f32 % 7.0;
-            mat_b[(r, c)] = (size * size - i) as f32 % 11.0;
-        }
-    }
-
-    info!("Executing Hardware Accelerated Multiplication (Xtensa SIMD)...");
-    let start_hw = Instant::now();
-    let result_hw = mat_a.esp_mul(&mat_b);
-    let duration_hw = start_hw.elapsed();
-    info!(
-        "-> Hardware Time: {} ms ({} microseconds)",
-        duration_hw.as_millis(),
-        duration_hw.as_micros()
-    );
-
-    info!("Executing ANSI Software Multiplication (nalgebra default)...");
-    let mut result_sw = AlignedDMat::<f32>::zeros(size, size);
-    let start_sw = Instant::now();
-    result_sw.gemm(1.0, &mat_a, &mat_b, 0.0);
-    let duration_sw = start_sw.elapsed();
-    info!(
-        "-> Software Time: {} ms ({} microseconds)",
-        duration_sw.as_millis(),
-        duration_sw.as_micros()
-    );
-
-    let mut diff_accum = 0.0;
-    for c in 0..size {
-        for r in 0..size {
-            diff_accum += (result_hw[(r, c)] - result_sw[(r, c)]).abs();
-        }
-    }
-
-    info!(
-        "Benchmark Result Consistency Check (Cumulative Error): {}",
-        diff_accum
-    );
-
-    let perf_gain = duration_sw.as_micros() as f32 / duration_hw.as_micros() as f32;
-    info!("===============================================");
-    info!(">>> PERFORMANCE GAIN: {:.2}x FASTER <<<", perf_gain);
-    info!("===============================================");
-}
-
-fn benchmark_matrix_math_ex() {
-    info!("--- BENCHMARK TEST (EXTENDED STRIDES) ---");
-    let m = 32;
-    let n = 32;
-    let k = 32;
-    let a_stride = 64;
-    let b_stride = 64;
-
-    info!("Allocating 64x64 matrices for benchmarking 32x32 sub-regions...");
-
-    let mut mat_a = AlignedDMat::<f32>::zeros(a_stride, a_stride);
-    let mut mat_b = AlignedDMat::<f32>::zeros(b_stride, b_stride);
-
-    for c in 0..a_stride {
-        for r in 0..a_stride {
-            let i = c * a_stride + r;
-            mat_a[(r, c)] = i as f32 % 7.0;
-        }
-    }
-
-    for c in 0..b_stride {
-        for r in 0..b_stride {
-            let i = c * b_stride + r;
-            mat_b[(r, c)] = (b_stride * b_stride - i) as f32 % 11.0;
-        }
-    }
-
-    info!("Executing Hardware Accelerated Multiplication (Xtensa SIMD EX)...");
-    let start_hw = Instant::now();
-    let result_hw = mat_a.esp_mul_ex(a_stride, &mat_b, b_stride, m, n, k);
-    let duration_hw = start_hw.elapsed();
-    info!(
-        "-> Hardware EX Time: {} ms ({} microseconds)",
-        duration_hw.as_millis(),
-        duration_hw.as_micros()
-    );
-
-    info!("Executing ANSI Software Multiplication (Manual Nested Loops)...");
-    let mut result_sw = AlignedDMat::<f32>::zeros(m, k);
-
-    let start_sw = Instant::now();
-    for i in 0..m {
-        for j in 0..k {
-            let mut sum = 0.0;
-            for s in 0..n {
-                sum += mat_a[(i, s)] * mat_b[(s, j)];
-            }
-            result_sw[(i, j)] = sum;
-        }
-    }
-    let duration_sw = start_sw.elapsed();
-    info!(
-        "-> Software EX Time: {} ms ({} microseconds)",
-        duration_sw.as_millis(),
-        duration_sw.as_micros()
-    );
-
-    let mut diff_accum = 0.0;
-    for j in 0..k {
-        for i in 0..m {
-            diff_accum += (result_hw[(i, j)] - result_sw[(i, j)]).abs();
-        }
-    }
-
-    info!(
-        "Benchmark EX Result Consistency Check (Cumulative Error): {}",
-        diff_accum
-    );
-
-    let perf_gain = duration_sw.as_micros() as f32 / duration_hw.as_micros() as f32;
-    info!("===============================================");
-    info!(">>> EX PERFORMANCE GAIN: {:.2}x FASTER <<<", perf_gain);
-    info!("===============================================");
-}
-
-fn benchmark_matrix_math_fixed() {
-    info!("--- BENCHMARK TEST (Q15 FIXED-POINT) ---");
-    let size = 64;
-
-    info!(
-        "Allocating {}x{} fixed-point matrices for benchmarking...",
-        size, size
-    );
-
-    let mut mat_a = AlignedDMat::<i16>::zeros(size, size);
-    let mut mat_b = AlignedDMat::<i16>::zeros(size, size);
-
-    for c in 0..size {
-        for r in 0..size {
-            let i = c * size + r;
-            mat_a[(r, c)] = (i as i16 * 17) % 2000;
-            mat_b[(r, c)] = (3000 - i as i16 * 13) % 2000;
-        }
-    }
-
-    info!("Executing Vector Accelerated Multiplication (Xtensa qacc)...");
-    let start_hw = Instant::now();
-    let result_hw = mat_a.esp_mul_fixed(&mat_b, 15);
-    let duration_hw = start_hw.elapsed();
-    info!(
-        "-> Hardware FIXED Time: {} ms ({} microseconds)",
-        duration_hw.as_millis(),
-        duration_hw.as_micros()
-    );
-
-    info!("Executing ANSI Software Fixed-Point Multiplication...");
-    let mut result_sw = AlignedDMat::<i16>::zeros(size, size);
-
-    let start_sw = Instant::now();
-    let round_offset = 32767 >> 15;
-
-    for i in 0..size {
-        for j in 0..size {
-            let mut sum: i32 = 0;
-            for s in 0..size {
-                sum += (mat_a[(i, s)] as i32) * (mat_b[(s, j)] as i32);
-            }
-            result_sw[(i, j)] = ((sum + round_offset) >> 15) as i16;
-        }
-    }
-    let duration_sw = start_sw.elapsed();
-    info!(
-        "-> Software FIXED Time: {} ms ({} microseconds)",
-        duration_sw.as_millis(),
-        duration_sw.as_micros()
-    );
-
-    let mut diff_accum: i32 = 0;
-    for j in 0..size {
-        for i in 0..size {
-            diff_accum += (result_hw[(i, j)] as i32 - result_sw[(i, j)] as i32).abs();
-        }
-    }
-
-    info!(
-        "Benchmark FIXED Result Consistency Check (Cumulative Rounding Drift): {}",
-        diff_accum
-    );
-
-    let perf_gain = duration_sw.as_micros() as f32 / duration_hw.as_micros() as f32;
-    info!("===============================================");
-    info!(">>> FIXED PERFORMANCE GAIN: {:.2}x FASTER <<<", perf_gain);
-    info!("===============================================");
-}
-
-fn benchmark_matrix_math_small_hot_loops() {
-    info!("--- BENCHMARK TEST (SMALL MATRICES HOT LOOP) ---");
-    let sizes = [4, 6, 8, 10];
-    let iterations = 5000;
-
-    for &size in &sizes {
-        info!(
-            "Allocating and benchmarking {}x{} matrix over {} iterations...",
-            size, size, iterations
-        );
-
-        let mut mat_a = AlignedDMat::<f32>::zeros(size, size);
-        let mut mat_b = AlignedDMat::<f32>::zeros(size, size);
-
-        let mut result_hw = AlignedDMat::<f32>::zeros(size, size);
-        let mut result_sw = AlignedDMat::<f32>::zeros(size, size);
-
-        for c in 0..size {
-            for r in 0..size {
-                let i = c * size + r;
-                mat_a[(r, c)] = i as f32 % 7.0;
-                mat_b[(r, c)] = (size * size - i) as f32 % 11.0;
-            }
-        }
-
-        let start_hw = Instant::now();
-        for _ in 0..iterations {
-            mat_a.esp_mul_to(&mat_b, &mut result_hw);
-        }
-        let duration_hw = start_hw.elapsed();
-        info!(
-            "-> Hardware {}x{} Time: {} ms ({} microseconds)",
-            size,
-            size,
-            duration_hw.as_millis(),
-            duration_hw.as_micros()
-        );
-
-        let start_sw = Instant::now();
-        for _ in 0..iterations {
-            result_sw.gemm(1.0, &mat_a, &mat_b, 0.0);
-        }
-        let duration_sw = start_sw.elapsed();
-        info!(
-            "-> Software {}x{} Time: {} ms ({} microseconds)",
-            size,
-            size,
-            duration_sw.as_millis(),
-            duration_sw.as_micros()
-        );
-
-        let perf_gain = duration_sw.as_micros() as f32 / duration_hw.as_micros() as f32;
-        info!("===============================================");
-        info!(
-            ">>> {}x{} HOT LOOP GAIN: {:.2}x FASTER <<<",
-            size, size, perf_gain
-        );
-        info!("===============================================");
-    }
-}
-
-fn benchmark_vector_math() {
-    info!("--- BENCHMARK TEST (VECTOR MATH) ---");
-    let size = 1024;
-    let iterations = 10000;
-
-    info!(
-        "Allocating {}x1 vectors for benchmarking over {} iterations...",
-        size, iterations
-    );
-
-    let mut vec_a = AlignedDVec::<f32>::zeros(size);
-    let mut vec_b = AlignedDVec::<f32>::zeros(size);
-    let mut vec_out = AlignedDVec::<f32>::zeros(size);
-
-    for i in 0..size {
-        vec_a[(i, 0)] = i as f32 % 7.0;
-        vec_b[(i, 0)] = (size - i) as f32 % 11.0;
-    }
-
-    // --- DOT PRODUCT ---
-    let start_hw_dot = Instant::now();
-    for _ in 0..iterations {
-        // Prevent the compiler from optimizing away the loop!
-        core::hint::black_box(vec_a.esp_dot(&vec_b));
-    }
-    let dur_hw_dot = start_hw_dot.elapsed();
-
-    let start_sw_dot = Instant::now();
-    for _ in 0..iterations {
-        // Prevent the compiler from optimizing away the loop!
-        core::hint::black_box(vec_a.dot(&vec_b));
-    }
-    let dur_sw_dot = start_sw_dot.elapsed();
-
-    info!(
-        "Dot Product: HW {}us vs SW {}us ({:.2}x FASTER)",
-        dur_hw_dot.as_micros(),
-        dur_sw_dot.as_micros(),
-        dur_sw_dot.as_micros() as f32 / dur_hw_dot.as_micros() as f32
-    );
-
-    // --- ADDITION ---
-    let start_hw_add = Instant::now();
-    for _ in 0..iterations {
-        vec_a.esp_add_to(&vec_b, &mut vec_out);
-    }
-    let dur_hw_add = start_hw_add.elapsed();
-
-    let start_sw_add = Instant::now();
-    for _ in 0..iterations {
-        for i in 0..size {
-            vec_out[(i, 0)] = vec_a[(i, 0)] + vec_b[(i, 0)];
-        }
-        core::hint::black_box(&vec_out); // Just to be safe
-    }
-    let dur_sw_add = start_sw_add.elapsed();
-
-    info!(
-        "Addition:    HW {}us vs SW {}us ({:.2}x FASTER)",
-        dur_hw_add.as_micros(),
-        dur_sw_add.as_micros(),
-        dur_sw_add.as_micros() as f32 / dur_hw_add.as_micros() as f32
-    );
-
-    // --- SUBTRACTION ---
-    let start_hw_sub = Instant::now();
-    for _ in 0..iterations {
-        vec_a.esp_sub_to(&vec_b, &mut vec_out);
-    }
-    let dur_hw_sub = start_hw_sub.elapsed();
-
-    let start_sw_sub = Instant::now();
-    for _ in 0..iterations {
-        for i in 0..size {
-            vec_out[(i, 0)] = vec_a[(i, 0)] - vec_b[(i, 0)];
-        }
-        core::hint::black_box(&vec_out);
-    }
-    let dur_sw_sub = start_sw_sub.elapsed();
-
-    info!(
-        "Subtraction: HW {}us vs SW {}us ({:.2}x FASTER)",
-        dur_hw_sub.as_micros(),
-        dur_sw_sub.as_micros(),
-        dur_sw_sub.as_micros() as f32 / dur_hw_sub.as_micros() as f32
-    );
-
-    // --- MULTIPLICATION ---
-    let start_hw_mul = Instant::now();
-    for _ in 0..iterations {
-        vec_a.esp_mul_elem_to(&vec_b, &mut vec_out);
-    }
-    let dur_hw_mul = start_hw_mul.elapsed();
-
-    let start_sw_mul = Instant::now();
-    for _ in 0..iterations {
-        for i in 0..size {
-            vec_out[(i, 0)] = vec_a[(i, 0)] * vec_b[(i, 0)];
-        }
-        core::hint::black_box(&vec_out);
-    }
-    let dur_sw_mul = start_sw_mul.elapsed();
-
-    info!(
-        "Multiply:    HW {}us vs SW {}us ({:.2}x FASTER)",
-        dur_hw_mul.as_micros(),
-        dur_sw_mul.as_micros(),
-        dur_sw_mul.as_micros() as f32 / dur_hw_mul.as_micros() as f32
-    );
-
-    info!("===============================================");
-}
-
-fn test_image_math() {
-    info!("--- FUNCTIONAL TEST (IMAGE MATH SIMD) ---");
-    let size = 64; // A multiple of 16 to test clean SIMD lanes
-
-    // Allocate raw vecs and slice them to guarantee 16-byte alignment
-    let mut raw_a = alloc::vec![0u8; size + 16];
-    let offset_a = raw_a.as_ptr().align_offset(16);
-    let slice_a = &mut raw_a[offset_a..offset_a + size];
-
-    let mut raw_b = alloc::vec![0u8; size + 16];
-    let offset_b = raw_b.as_ptr().align_offset(16);
-    let slice_b = &mut raw_b[offset_b..offset_b + size];
-
-    for i in 0..size {
-        slice_a[i] = (i * 3) as u8;
-        slice_b[i] = (255 - i) as u8;
-    }
-
-    let mut success = true;
-
-    // 1. Min/Max Test
-    let (min_hw, max_hw) = slice_a.esp_min_max();
-    let min_sw = *slice_a.iter().min().unwrap();
-    let max_sw = *slice_a.iter().max().unwrap();
-
-    if min_hw != min_sw || max_hw != max_sw {
-        error!(
-            "MIN/MAX FAILED: HW=({}, {}), SW=({}, {})",
-            min_hw, max_hw, min_sw, max_sw
-        );
-        success = false;
-    }
-
-    // 2. Sum Test
-    let sum_hw = slice_a.esp_sum();
-    // Use an iterator mapping to u32 so the software implementation doesn't overflow
-    let sum_sw: u32 = slice_a.iter().map(|&x| x as u32).sum();
-
-    if sum_hw != sum_sw {
-        error!("SUM FAILED: HW={}, SW={}", sum_hw, sum_sw);
-        success = false;
-    }
-
-    if success {
-        info!("SUCCESS: Assembly SIMD Image math matches standard software math");
-    } else {
-        error!("FAILED: Image math SIMD operations produced incorrect results.");
-    }
-}
-
-fn benchmark_image_math() {
-    info!("--- BENCHMARK TEST (IMAGE MATH SIMD) ---");
-    // Simulate a standard QQVGA image buffer size (160x120 = 19,200 pixels)
-    let size = 19_200;
-    let iterations = 1000;
-
-    info!(
-        "Allocating {} byte image buffers for benchmarking over {} iterations...",
-        size, iterations
-    );
-
-    // Guaranteed 16-byte aligned buffers
-    let mut raw_a = alloc::vec![0u8; size + 16];
-    let offset_a = raw_a.as_ptr().align_offset(16);
-    let slice_a = &mut raw_a[offset_a..offset_a + size];
-
-    let mut raw_b = alloc::vec![0u8; size + 16];
-    let offset_b = raw_b.as_ptr().align_offset(16);
-    let slice_b = &mut raw_b[offset_b..offset_b + size];
-
-    // Pre-fill with arbitrary data
-    for i in 0..size {
-        slice_a[i] = (i % 256) as u8;
-        slice_b[i] = ((size - i) % 256) as u8;
-    }
-
-    // --- MIN / MAX BENCHMARK ---
-    let start_hw_minmax = Instant::now();
-    for _ in 0..iterations {
-        core::hint::black_box(slice_a.esp_min_max());
-    }
-    let dur_hw_minmax = start_hw_minmax.elapsed();
-
-    let start_sw_minmax = Instant::now();
-    for _ in 0..iterations {
-        let min = *slice_a.iter().min().unwrap();
-        let max = *slice_a.iter().max().unwrap();
-        core::hint::black_box((min, max));
-    }
-    let dur_sw_minmax = start_sw_minmax.elapsed();
-
-    info!(
-        "Min/Max: HW {}us vs SW {}us ({:.2}x FASTER)",
-        dur_hw_minmax.as_micros(),
-        dur_sw_minmax.as_micros(),
-        dur_sw_minmax.as_micros() as f32 / dur_hw_minmax.as_micros() as f32
-    );
-
-    // --- SUM BENCHMARK ---
-    let start_hw_sum = Instant::now();
-    for _ in 0..iterations {
-        core::hint::black_box(slice_a.esp_sum());
-    }
-    let dur_hw_sum = start_hw_sum.elapsed();
-
-    let start_sw_sum = Instant::now();
-    for _ in 0..iterations {
-        let sum: u32 = slice_a.iter().map(|&x| x as u32).sum();
-        core::hint::black_box(sum);
-    }
-    let dur_sw_sum = start_sw_sum.elapsed();
-
-    info!(
-        "Sum:     HW {}us vs SW {}us ({:.2}x FASTER)",
-        dur_hw_sum.as_micros(),
-        dur_sw_sum.as_micros(),
-        dur_sw_sum.as_micros() as f32 / dur_hw_sum.as_micros() as f32
-    );
-
-    info!("===============================================");
-}
+static mut SPI_TX_PAYLOAD: SpiPayload = SpiPayload::empty();
+
+const CHUNK_LINES: usize = 16;
+const CHUNK_SIZE: usize = 640 * CHUNK_LINES;
+static mut SRAM_CHUNK_A: [core::mem::MaybeUninit<u8>; CHUNK_SIZE] =
+    [core::mem::MaybeUninit::uninit(); CHUNK_SIZE];
 
 #[allow(
     clippy::large_stack_frames,
     reason = "it's not unusual to allocate larger buffers etc. in main"
 )]
 #[esp_rtos::main]
-async fn main(spawner: Spawner) -> ! {
+async fn main(_spawner: Spawner) -> ! {
     esp_println::logger::init_logger_from_env();
+    info!("Starting ESP-Vision Coprocessor...");
 
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
 
     esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 73744);
 
+    unsafe {
+        esp_alloc::HEAP.add_region(esp_alloc::HeapRegion::new(
+            0x3c00_0000 as *mut u8,
+            8 * 1024 * 1024,
+            esp_alloc::MemoryCapability::External.into(),
+        ));
+    }
+
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     esp_rtos::start(timg0.timer0);
 
-    info!("Embassy initialized!");
+    let lcd_cam = LcdCam::new(peripherals.LCD_CAM);
+    let cam_config = CamConfig::default().with_frequency(Rate::from_mhz(20));
 
-    test_matrix_math();
-    test_matrix_math_ex();
-    test_matrix_math_fixed();
-    test_vector_math();
-    test_image_math();
+    let mut camera = Camera::new(lcd_cam.cam, peripherals.DMA_CH0, cam_config)
+        .unwrap()
+        .with_master_clock(peripherals.GPIO15)
+        .with_pixel_clock(peripherals.GPIO13)
+        .with_vsync(peripherals.GPIO6)
+        .with_h_enable(peripherals.GPIO7)
+        .with_data0(peripherals.GPIO11)
+        .with_data1(peripherals.GPIO9)
+        .with_data2(peripherals.GPIO8)
+        .with_data3(peripherals.GPIO10)
+        .with_data4(peripherals.GPIO12)
+        .with_data5(peripherals.GPIO18)
+        .with_data6(peripherals.GPIO17)
+        .with_data7(peripherals.GPIO16);
 
-    benchmark_matrix_math();
-    benchmark_matrix_math_ex();
-    benchmark_matrix_math_fixed();
-    benchmark_matrix_math_small_hot_loops();
-    benchmark_vector_math();
-    benchmark_image_math();
+    let i2c = I2c::new(peripherals.I2C0, I2cConfig::default())
+        .unwrap()
+        .with_sda(peripherals.GPIO4)
+        .with_scl(peripherals.GPIO5)
+        .into_async();
 
-    let _ = spawner;
+    let mut camera_sensor = Ov2640::new(i2c);
+    info!("Initializing OV2640...");
+    camera_sensor
+        .init_yuv422()
+        .await
+        .expect("Failed to init OV2640");
+    camera_sensor
+        .set_resolution(Resolution::Res640x480)
+        .await
+        .expect("Failed to set resolution");
 
-    loop {
-        info!("Node idling...");
-        Timer::after(Duration::from_secs(5)).await;
-    }
+    let spi_dma_channel = peripherals.DMA_CH2;
+    let mut spi_slave = Spi::new(peripherals.SPI2, SpiMode::_0)
+        .with_sck(peripherals.GPIO39)
+        .with_mosi(peripherals.GPIO40)
+        .with_miso(peripherals.GPIO41)
+        .with_cs(peripherals.GPIO42)
+        .with_dma(spi_dma_channel);
+
+    info!("Pipeline initialized. Starting concurrent execution.");
+
+    let spi_slave_future = async {
+        let (tx_descriptors, _) = esp_hal::dma_descriptors!(core::mem::size_of::<SpiPayload>(), 0);
+
+        let mut spi_tx_buf = DmaTxBuf::new(tx_descriptors, unsafe {
+            core::slice::from_raw_parts_mut(
+                core::ptr::addr_of_mut!(SPI_TX_PAYLOAD) as *mut u8,
+                core::mem::size_of::<SpiPayload>(),
+            )
+        })
+        .unwrap();
+
+        loop {
+            let transfer = match spi_slave.write(core::mem::size_of::<SpiPayload>(), spi_tx_buf) {
+                Ok(t) => t,
+                Err(_) => panic!("SPI Write initialization failed"),
+            };
+
+            while !transfer.is_done() {
+                embassy_futures::yield_now().await;
+            }
+
+            let (reclaimed_spi, reclaimed_buf) = transfer.wait();
+            spi_slave = reclaimed_spi;
+            spi_tx_buf = reclaimed_buf;
+        }
+    };
+
+    let vision_pipeline_future = async {
+        let total_lines = 480;
+        let chunks_count = total_lines / CHUNK_LINES;
+        let mut global_uf = RleUnionFind::new(8000);
+
+        let mut mono_image = esp_vision::apriltag::image::Image::new(640, 480, 640);
+
+        let (rx_descriptors, _) = esp_hal::dma_descriptors!(614400, 0);
+
+        let camera_yuyv_psram: &'static mut [u8] = alloc::vec![0u8; 614_400].leak();
+
+        let camera_yuyv_ptr = camera_yuyv_psram.as_ptr();
+
+        let mut dma_rx_buf = DmaRxBuf::new(rx_descriptors, camera_yuyv_psram).unwrap();
+
+        let sram_chunk_slice = unsafe {
+            core::slice::from_raw_parts_mut(
+                core::ptr::addr_of_mut!(SRAM_CHUNK_A) as *mut u8,
+                CHUNK_SIZE,
+            )
+        };
+
+        loop {
+            let capture_start = Instant::now();
+            global_uf.clear();
+
+            let transfer = match camera.receive(dma_rx_buf) {
+                Ok(t) => t,
+                Err(_) => panic!("Camera RX initialization failed"),
+            };
+
+            while !transfer.is_done() {
+                embassy_futures::yield_now().await;
+            }
+
+            let (_, reclaimed_cam, reclaimed_buf) = transfer.wait();
+            camera = reclaimed_cam;
+            dma_rx_buf = reclaimed_buf;
+
+            let camera_read_slice =
+                unsafe { core::slice::from_raw_parts(camera_yuyv_ptr, 614_400) };
+
+            let mono_psram = mono_image.as_mut_slice();
+            for i in 0..(640 * 480) {
+                mono_psram[i] = camera_read_slice[i * 2];
+            }
+
+            for i in 0..chunks_count {
+                let y_offset = i * CHUNK_LINES;
+                let offset = i * CHUNK_SIZE;
+
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        mono_psram.as_ptr().add(offset),
+                        sram_chunk_slice.as_mut_ptr(),
+                        CHUNK_SIZE,
+                    );
+                }
+
+                for p in sram_chunk_slice.iter_mut() {
+                    *p = if *p > 125 { 255 } else { 0 };
+                }
+
+                global_uf.process_chunk(sram_chunk_slice, 640, CHUNK_LINES, y_offset);
+            }
+
+            global_uf.flatten();
+            let blobs = global_uf.extract_valid_blobs(50, 10_000);
+
+            let intrinsics = esp_vision::apriltag::pose::CameraIntrinsics {
+                fx: 500.0,
+                fy: 500.0,
+                cx: 320.0,
+                cy: 240.0,
+                tag_size_mm: 165.0,
+            };
+
+            let mut valid_detections = [AprilTagDetection {
+                id: 0,
+                hamming: 0,
+                rotation: 0,
+                confidence: 0.0,
+                center_x: 0.0,
+                center_y: 0.0,
+                yaw: 0.0,
+                pitch: 0.0,
+                roll: 0.0,
+                distance_mm: 0.0,
+            }; 10];
+            let mut tag_count = 0;
+
+            for blob in &blobs {
+                let boundary =
+                    esp_vision::apriltag::quad::extract_ordered_boundary(blob, &global_uf.segments);
+
+                if let Some(quad) = esp_vision::apriltag::quad::find_quad_corners(&boundary) {
+                    if let Some(detection) = esp_vision::apriltag::decode::extract_detection(
+                        &mono_image,
+                        &quad,
+                        &intrinsics,
+                    ) {
+                        if tag_count < 10 {
+                            valid_detections[tag_count] = detection;
+                            tag_count += 1;
+                        } else {
+                            info!("Max tags (10) reached, dropping additional detections.");
+                            break;
+                        }
+                    }
+                }
+            }
+
+            unsafe {
+                let next_seq = SPI_TX_PAYLOAD.sequence.wrapping_add(1) | 1;
+                SPI_TX_PAYLOAD.sequence = next_seq;
+                core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+
+                SPI_TX_PAYLOAD.timestamp_ms = Instant::now().as_millis();
+                SPI_TX_PAYLOAD.tag_count = tag_count as u8;
+                SPI_TX_PAYLOAD.tags = valid_detections;
+
+                core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+                SPI_TX_PAYLOAD.sequence = next_seq.wrapping_add(1);
+            }
+
+            info!(
+                "Frame complete: {} tags in {}ms",
+                tag_count,
+                capture_start.elapsed().as_millis()
+            );
+        }
+    };
+
+    embassy_futures::join::join(spi_slave_future, vision_pipeline_future).await;
+    unreachable!();
 }

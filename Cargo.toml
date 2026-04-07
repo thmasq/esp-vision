@@ -26,6 +26,7 @@ critical-section = "1.2.0"
 embedded-hal-async = "1.0.0"
 nalgebra = { version = "0.34.2", default-features = false, features = ["libm", "alloc"] }
 static_cell = "2.1.1"
+embassy-futures = "0.1.2"
 
 [profile.dev]
 opt-level = "s"
